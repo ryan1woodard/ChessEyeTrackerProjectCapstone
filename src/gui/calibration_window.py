@@ -27,7 +27,7 @@ from PySide6.QtGui import QColor, QFont, QKeyEvent, QPainter, QPen
 from PySide6.QtWidgets import QWidget
 
 from ..tracking.calibration import (CalibrationSession, calibration_pattern,
-                                    pattern_to_pixels)
+                                    pattern_to_pixels, posture_cue)
 from ..tracking.pipeline import GazeSample
 from ..utils.config import Config
 from ..utils.geometry import Rect
@@ -79,13 +79,14 @@ class CalibrationWindow(QWidget):
             max_yaw=float(config.get("tracking.max_head_yaw_deg", 40.0)),
             max_pitch=float(config.get("tracking.max_head_pitch_deg", 30.0)),
             min_openness=float(config.get("tracking.blink_ear_threshold", 0.16)),
+            margin_fraction=float(config.get("calibration.margin_fraction", 0.15)),
         )
 
         self._settle_ms = int(config.get("calibration.settle_ms", 700))
         self._dwell_ms = int(config.get("calibration.dwell_ms", 900))
         self._quota = int(config.get("calibration.samples_per_point", 20))
         self._radius = int(config.get("calibration.target_radius_px", 18))
-        self._head_motion_hint = bool(config.get("calibration.head_motion_guidance", True))
+        self._posture_hint = bool(config.get("calibration.posture_guidance", True))
 
         self._index = 0
         self._phase = PHASE_INTRO
@@ -232,6 +233,7 @@ class CalibrationWindow(QWidget):
         elif self._phase in (PHASE_SETTLE, PHASE_COLLECT):
             self._paint_target(painter)
             self._paint_status(painter)
+            self._paint_posture(painter)
         painter.end()
 
     def _paint_intro(self, painter: QPainter) -> None:
@@ -244,11 +246,13 @@ class CalibrationWindow(QWidget):
         painter.setPen(QPen(QColor(180, 190, 205)))
         lines = (
             "Look directly at each dot until its ring fills.\n\n"
-            "While you look, keep your eyes locked on the dot and let your\n"
-            "head drift gently -- a little left and right, nearer and further.\n"
-            "This is important: it is what teaches the tracker to stay accurate\n"
-            "when you shift in your chair later. Holding perfectly still makes\n"
-            "the tracker fragile.\n\n"
+            "Above each dot you will be asked to hold a posture -- tilt your\n"
+            "head a little to one side, lean in, sit back. Adopt it, then keep\n"
+            "your eyes on the dot while you hold it.\n\n"
+            "Every posture is a small one. What matters is that the tracker\n"
+            "sees a few of them: it can only correct for head positions it has\n"
+            "actually observed, so tilting your head during a game after a\n"
+            "perfectly still calibration is what makes the pointer drift.\n\n"
             "Sit at your normal playing distance.\n\n"
             f"{len(self._targets)} points, about "
             f"{len(self._targets) * (self._settle_ms + self._dwell_ms) / 1000:.0f} seconds.\n\n"
@@ -284,19 +288,26 @@ class CalibrationWindow(QWidget):
         painter.drawEllipse(center, max(2.0, self._radius * 0.22),
                             max(2.0, self._radius * 0.22))
 
+    def _paint_posture(self, painter: QPainter) -> None:
+        """The posture asked for at this target.
+
+        Drawn during the settle phase too, not only while sampling, so the user
+        has time to adopt the posture before any frame is recorded.
+        """
+        if not self._posture_hint:
+            return
+        painter.setPen(QPen(QColor(150, 205, 255)))
+        painter.setFont(QFont("Segoe UI", 14, QFont.DemiBold))
+        painter.drawText(self.rect().adjusted(0, 0, 0, -88),
+                         Qt.AlignHCenter | Qt.AlignBottom,
+                         f"{posture_cue(self._index)} - keep your eyes on the dot")
+
     def _paint_status(self, painter: QPainter) -> None:
         painter.setFont(QFont("Segoe UI", 14))
         painter.setPen(QPen(QColor(200, 208, 220)))
         text = f"Calibration {self._index + 1} of {len(self._targets)}"
         painter.drawText(self.rect().adjusted(0, 0, 0, -60), Qt.AlignHCenter | Qt.AlignBottom,
                          text)
-
-        if self._phase == PHASE_COLLECT and self._head_motion_hint:
-            painter.setPen(QPen(QColor(150, 205, 255)))
-            painter.setFont(QFont("Segoe UI", 12))
-            painter.drawText(self.rect().adjusted(0, 0, 0, -88),
-                             Qt.AlignHCenter | Qt.AlignBottom,
-                             "Eyes on the dot - let your head move gently")
 
         if not self._face_present:
             painter.setPen(QPen(QColor(255, 170, 70)))

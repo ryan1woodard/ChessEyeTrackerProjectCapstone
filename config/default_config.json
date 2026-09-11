@@ -20,13 +20,15 @@
     "eyes_closed_ms": 1200,
     "sample_log_hz": 10.0,
     "feature_smoothing": "medium",
-    "blink_recovery_ms": 120
+    "blink_recovery_ms": 120,
+    "max_head_roll_deg": 35.0,
+    "reacquire_ms": 500
   },
   "calibration": {
     "pattern": "13point",
     "dwell_ms": 1500,
     "settle_ms": 800,
-    "samples_per_point": 34,
+    "samples_per_point": 40,
     "target_radius_px": 18,
     "poly_degree": 2,
     "ridge_alphas": [
@@ -43,20 +45,21 @@
       3000.0
     ],
     "model_features": [
-      "iris_l_x",
-      "iris_l_y",
-      "iris_r_x",
-      "iris_r_y",
+      "iris_l_ix",
+      "iris_l_iy",
+      "iris_r_ix",
+      "iris_r_iy",
+      "eye_tilt",
       "yaw",
       "pitch",
-      "face_x",
-      "face_y",
-      "face_scale"
+      "head_x",
+      "head_y",
+      "head_z"
     ],
     "quality_good_px": 0.0,
     "quality_fair_px": 0.0,
     "margin_fraction": 0.15,
-    "head_motion_guidance": true
+    "posture_guidance": true
   },
   "screen": {
     "monitor_index": 1,

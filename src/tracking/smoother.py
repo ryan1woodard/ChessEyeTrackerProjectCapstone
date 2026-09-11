@@ -18,29 +18,42 @@ import math
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
+#: Output-filter presets, in (min_cutoff Hz, beta) pairs.
+#:
+#: Swept jointly with the feature presets below against the geometric
+#: simulator, scoring three things that trade off against each other: the error
+#: over the settled tail of a fixation, the peak-to-peak wobble during that
+#: tail, and how long a cross-screen saccade takes to land within 90 px.
+#:
+#: ``beta`` must never be zero at these cutoffs. A cutoff of 0.3 Hz with no
+#: speed term takes over a second to follow a saccade -- the filter has no
+#: mechanism to open up -- which measured as 1355 ms in the sweep against
+#: 133 ms for the value below. The low cutoff is only affordable *because*
+#: beta releases it the moment the eyes move.
 SMOOTHING_PRESETS: Dict[str, Dict[str, float]] = {
     "off": {"min_cutoff": 1000.0, "beta": 0.0},
-    "low": {"min_cutoff": 2.0, "beta": 0.02},
-    "medium": {"min_cutoff": 0.9, "beta": 0.006},
-    "high": {"min_cutoff": 0.4, "beta": 0.002},
+    "low": {"min_cutoff": 1.5, "beta": 0.02},
+    "medium": {"min_cutoff": 0.3, "beta": 0.007},
+    "high": {"min_cutoff": 0.3, "beta": 0.002},
 }
 
-#: Matching presets for the input-feature filters. These are gentler than the
-#: output presets: features are filtered before the polynomial amplifies them,
-#: so a little goes a long way, and over-filtering here would delay saccades.
-#: ``beta`` is far larger here than in the output presets, and deliberately so.
-#: One Euro relaxes its filtering in proportion to ``beta * speed``, and feature
-#: values are two orders of magnitude smaller than pixel coordinates -- an iris
-#: offset moves by ~0.1 where a gaze point moves by ~1000. A pixel-sized beta is
-#: therefore invisible against feature-sized speeds, and the filter never opens
-#: up during a saccade. Tuned against the simulator: these values cut
-#: peak-to-peak jitter from 98 px to 42 px while a cross-screen saccade still
-#: settles in ~130 ms.
+#: Matching presets for the input-feature filters.
+#:
+#: ``beta`` is three orders of magnitude larger here than in the output presets,
+#: and deliberately so. One Euro relaxes its filtering in proportion to
+#: ``beta * speed``, and feature values are two orders of magnitude smaller than
+#: pixel coordinates -- an iris offset moves by ~0.1 where a gaze point moves by
+#: ~1000. A pixel-sized beta is invisible against feature-sized speeds, and the
+#: filter would never open up during a saccade.
+#:
+#: Measured with the medium output preset: peak-to-peak wobble during a fixation
+#: falls from 58 px unfiltered to 17 px, while a cross-screen saccade still
+#: settles in about 133 ms.
 FEATURE_SMOOTHING_PRESETS: Dict[str, Dict[str, float]] = {
     "off": {"min_cutoff": 1000.0, "beta": 0.0},
-    "low": {"min_cutoff": 2.0, "beta": 20.0},
-    "medium": {"min_cutoff": 1.0, "beta": 15.0},
-    "high": {"min_cutoff": 0.6, "beta": 8.0},
+    "low": {"min_cutoff": 2.0, "beta": 10.0},
+    "medium": {"min_cutoff": 1.0, "beta": 10.0},
+    "high": {"min_cutoff": 0.5, "beta": 5.0},
 }
 
 

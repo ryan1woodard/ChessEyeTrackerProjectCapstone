@@ -41,9 +41,10 @@ Read this before you draw conclusions from the numbers.
   angle in good conditions, which on a typical monitor is 50-150 pixels. On a
   600 px chessboard the squares are 75 px, so individual squares are at the
   edge of what is resolvable. Neighbouring-square confusion is normal.
-- Accuracy degrades as soon as you move. Calibration ties the model to one head
-  position, one seating distance and one monitor. Shift your chair and you
-  should recalibrate.
+- Accuracy still degrades once you move well outside the postures calibration
+  observed. The calibration prompts cover a range of head tilts, distances and
+  offsets, but it is tied to one seating position and one monitor. Move to a
+  noticeably different posture and you should recalibrate.
 - Glasses, strong backlighting, dim rooms and off-axis webcams all reduce
   accuracy, sometimes drastically.
 - Board detection is a convenience, not a guarantee. Unusual themes, heavy
@@ -123,33 +124,42 @@ python app.py --monitor 2     # track the second monitor
 Press **Start Tracking**, then **Calibrate**. A full-screen window shows 13
 targets one at a time. Look directly at each dot until its green ring fills.
 
-**Let your head move gently while you do this.** Keep your eyes locked on the
-dot, but drift your head a little -- left and right, nearer and further. This
-is counter-intuitive and it matters more than anything else in this document.
+**Each dot names a posture -- adopt it.** Above the target you will be asked to
+tilt your head a little to one side, lean in, or sit back. Do it, then keep
+your eyes on the dot while you hold it. This is counter-intuitive and it
+matters more than anything else in this document.
 
-A calibration recorded with the head clamped still teaches the tracker nothing
-about how head movement and eye movement trade off, so the moment you shift in
-your chair the estimate degrades badly. Measured against the simulator, an 8
-degree head turn costs **313 px** of error after a still-head calibration and
-**39 px** after a head-varied one. Sit at your normal playing distance.
+The tracker can only correct for head positions it has actually observed. A
+calibration recorded sitting rigidly still contains no information about how
+head movement and eye movement trade off, so the moment you tilt your head or
+shift in your chair the estimate degrades badly. Measured against the
+simulator, a 20 degree head tilt costs **238 px** of error after a still
+calibration and **36 px** after one that followed the prompts. Every posture
+asked for is a small one. Sit at your normal playing distance.
 
 Press `R` during a target to redo it, or `Esc` to cancel.
 
 At the end you get a report:
 
 ```
-Average error: 74 px
-Median error:  61 px
-Worst error:   183 px
+Holding your gaze steady: 33 px
+Any single frame:         50 px
+Worst calibration point:  85 px
 
 Quality: GOOD
 ```
 
-These figures come from **leave-one-point-out cross-validation**: for each
-calibration target the model is refitted without it and then asked to predict
-it. That means the error you are shown estimates accuracy at screen positions
-the model has never seen, which is what you actually care about. A training-set
-error would look far better and mean nothing.
+The first figure is the one you will notice: the error once smoothing has
+settled on a square you are looking at. The second is a single unsmoothed
+frame, which is noisier by nature. Both come from **leave-one-point-out
+cross-validation**: for each calibration target the model is refitted without
+it and then asked to predict it, so the error estimates accuracy at screen
+positions the model has never seen. A training-set error would look far better
+and mean nothing.
+
+If the report adds a note about seeing very little head tilt or movement, the
+prompts were not followed closely enough; recalibrating and following them will
+fix it.
 
 If quality comes back POOR you are offered **Calibrate Again** or **Use
 Anyway**.
@@ -280,6 +290,9 @@ Heatmaps are reconstructed from stored gaze coordinates, not from saved images.
 | Accuracy decays as you shift position | Recalibrate, letting your head drift gently during each dot. Use Quick Recentre for a steady offset. |
 | Dot jumps around while you stare | Set Smoothing to High in Settings. If it persists, improve lighting: noisy landmarks are the root cause. |
 | A blink knocks the estimate off | Should no longer happen; raise "Hold estimate after a blink" in Settings if it does. |
+| The dot drifts off as soon as you tilt your head | Recalibrate and follow the posture prompts above each dot; a calibration that never saw tilt cannot correct for it. |
+| Nothing tracks at all, but your face is detected | Usually narrow or hooded eyes read as permanently closed. The closed-eye threshold now adapts to you over the first half-second; if it persists, lower "blink_ear_threshold" in the config. |
+| The dot lags behind for a second after you look back at the screen | Fixed in this version; the filters are dropped after a gap in tracking rather than blended across it. |
 | "module 'mediapipe' has no attribute 'solutions'" | MediaPipe 0.10.30+ removed that API. Run `pip install -r requirements.txt --upgrade`, or let the app download the Tasks model on first run. |
 | Camera preview stays "off" | The tracking worker failed to start; the real error is in the status bar and `logs/eye_tracker.log`. The preview only shows frames while the worker is alive. |
 | "No webcam detected" | Connect a webcam and restart. Check no other app holds it. |
@@ -366,28 +379,81 @@ error of the best is chosen. With only 13 points the minimum is noisy, and the
 simpler model extrapolates far better outside the calibrated region -- which is
 where a gaze tracker spends most of its time.
 
-**Calibration deliberately samples head movement.** Because the camera sees eye
-rotation relative to the *head*, head rotation and eye rotation trade off
-against each other: the same iris offset points at different screen positions
-depending on where the head is. A calibration recorded at one fixed head pose
-contains no information about that trade-off, so it cannot compensate for it.
-Sampling a range of head positions during calibration is what makes the tracker
-survive the user shifting in their chair.
+**Calibration asks for specific postures, one per target.** Because the camera
+sees eye rotation relative to the *head*, head rotation and eye rotation trade
+off against each other: the same iris offset points at different screen
+positions depending on where the head is. A calibration recorded at one fixed
+pose contains no information about that trade-off, and predictions outside the
+range it observed are clamped to the edge of that range -- so a posture never
+sampled is a posture never compensated for.
+
+Earlier versions asked the user to "let your head drift gently" and hoped. That
+is not reliable enough, least of all for tilt, which people do not vary on
+their own. Each target now names a posture instead -- tilt left, tilt right,
+lean in, sit back -- so the training data covers the axes that matter by
+construction. The session reports which axes it saw too little of, and the
+result dialog passes that on.
+
+**The regularisation is chosen against single frames, not their average.**
+Leave-one-point-out cross-validation used to score the *mean* of the held-out
+frames at each target. That measures only the model's bias there and cancels
+the frame-to-frame noise that regularisation exists to control, so an
+under-regularised model scored beautifully -- its centroid sits on the dot --
+while in use it amplified landmark jitter into tens of pixels of wobble.
+Scoring frames makes the trade-off visible. Both numbers are reported: the
+per-frame error, and the settled error a steady fixation is worth.
 
 **Both the inputs and the output are filtered.** Smoothing only the output is
 too late: the degree-2 polynomial amplifies input noise first, and amplified
-noise cannot be removed afterwards without adding visible lag. Filtering the
-iris and head features on the way in cuts peak-to-peak wobble from 98 px to
-42 px while a cross-screen saccade still settles in about 130 ms. The feature
-filters use a much larger One Euro `beta` than the output filter, because
-feature values are two orders of magnitude smaller than pixel coordinates and a
-pixel-sized `beta` would never let the filter open up during a saccade.
+noise cannot be removed afterwards without adding visible lag. Accuracy here is
+noise-limited rather than model-limited -- with perfect landmarks the same model
+reaches 20 px, against 37 px with realistic landmark jitter -- so this is where
+the remaining error lives.
+
+Both filters were swept jointly against the simulator on three competing
+measures: settled error, peak-to-peak wobble during a fixation, and how long a
+cross-screen saccade takes to land. On the medium preset that gives **14 px**
+settled error with **16 px** of wobble and a **133 ms** saccade, from 33 px and
+144 px unfiltered.
+
+The feature filters use a One Euro `beta` three orders of magnitude larger than
+the output filter's, because feature values are two orders of magnitude smaller
+than pixel coordinates and a pixel-sized `beta` would never let the filter open
+up during a saccade. Neither `beta` may be zero: at the output filter's 0.3 Hz
+cutoff, removing the speed term takes a saccade 1355 ms to follow instead of
+133 ms, because nothing can release the filter.
 
 **Blinks hold rather than update.** MediaPipe keeps reporting iris landmarks
 while the lid is closed; they are simply wrong. Feeding them to the model throws
 the estimate and, worse, poisons the smoothing filter so the error outlives the
 blink by a second or more. During a closure, and for a short recovery window
 after it, the last good estimate is held and nothing reaches the filters.
+
+**"Closed" is learned per user, not fixed.** Openness is the lid gap over the
+eye width, and that ratio varies by more than a factor of two between people.
+A single fixed threshold either treats narrow or hooded eyes as permanently
+blinking -- no tracking at all, and calibration that rejects every frame -- or
+lets other users' blinks straight through. A high quantile of recent openness
+is the user's own baseline, and a closure is a fall to a fraction of it. The
+baseline is learned from every frame rather than from frames already judged
+open, because judging first deadlocks on exactly the users it exists for.
+
+**A gap in tracking discards the filter state.** The filters hold the last value
+they saw with no notion of how long ago that was. After the face is lost for a
+second or two -- a turn away, a hand across the face -- that value describes a
+moment that has gone, and blending it into the first frame back drags the
+estimate towards where the user *used* to be looking. Past the re-acquisition
+window the state is dropped, so tracking re-locks in one frame instead of four.
+
+**Both head-pose backends are normalised to one convention.** `solvePnP` and the
+MediaPipe Tasks transformation matrix disagreed on the sign of roll, and the
+Tasks path disagreed with its own documented convention on yaw. A calibration
+profile is numbers fitted to whatever the angles meant on the day, so an angle
+whose sign depends on the installed MediaPipe build silently invalidates saved
+profiles. Roll now comes from the eye-corner line on both paths: the corners
+are among the most stable landmarks on the face, it is one `arctan2` with
+nothing to diverge, and it is the same rotation the image-aligned iris features
+are expressed in, so the two can never disagree.
 
 **Predictions are clamped.** A polynomial extrapolates without limit, so one
 bad frame can produce a coordinate in the millions and poison the smoothing
@@ -399,12 +465,37 @@ filter for seconds. Estimates are clamped to the screen plus a margin, with an
 perfectly and generalise terribly. The model is a degree-2 polynomial ridge
 regression whose regularisation strength is chosen by leave-one-point-out CV.
 
-**Features are scale- and roll-invariant.** Every eye measurement is divided by
-that eye's own corner-to-corner width, and iris offsets are expressed in the
-eye's local frame rather than image axes. Moving closer to the camera or
-tilting your head therefore does not shift the features. Vertical offsets are
-normalised by eye *width*, not height, because eye height collapses during a
-blink.
+**Iris offsets are measured on the camera's axes, not the eye's.** Every eye
+measurement is divided by that eye's own corner-to-corner width, so moving
+closer to the camera does not shift the features. The *rotation* is the subtle
+part, and getting it wrong was this project's largest single source of error.
+
+An offset measured along the eye's own axis, outer corner to inner corner, is
+roll-invariant: the axis rotates with the head, so the number is identical
+whether you sit upright or tilt 20 degrees. That sounds like the property you
+want and it is exactly the wrong one. Screen position is a world-frame
+quantity, and an eye-local offset has deliberately discarded the tilt that
+relates the two, so no amount of calibration can recover it. Measured against
+the simulator that cost **219 px** of error across a range of head tilts
+against **36 px** sitting upright.
+
+Offsets are therefore also resolved on the camera's own horizontal and vertical
+axes. The camera does not tilt, so that pair tracks where the eye points in the
+world and head tilt drops out of the mapping. Both frames are kept -- the
+eye-local pair still carries vergence and openness -- along with `eye_tilt`, the
+roll read straight off the eye-corner line. Tilt error is now **37 px**, with
+no loss at all in the upright case.
+
+Vertical offsets are normalised by eye *width*, not height, because eye height
+collapses during a blink.
+
+**Head position is expressed in millimetres, not pixels.** Dividing the
+apparent offset of the eyes by their apparent separation cancels the
+perspective division, giving `head_x`, `head_y` and `head_z` that are
+proportional to real displacement -- and a `head_z` proportional to distance
+rather than to its reciprocal. A degree-2 polynomial fits a straight line in
+those easily and a 1/z curve in the raw pixel values badly, which is what a
+user leaning back exposes.
 
 **One Euro filter for smoothing.** A moving average would trade jitter for lag.
 The One Euro filter filters hard when the signal is slow and relaxes as speed
@@ -484,5 +575,6 @@ research formats.
 ## Licence
 
 MIT. See `LICENSE`.
-#   C h e s s E y e T r a c k e r P r o j e c t C a p s t o n e  
+#   C h e s s E y e T r a c k e r P r o j e c t C a p s t o n e 
+ 
  

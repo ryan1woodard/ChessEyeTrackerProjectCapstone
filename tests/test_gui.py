@@ -132,6 +132,60 @@ class TestCalibrationWindow:
             window._phase = phase
             window.render(QPixmap(800, 600))
 
+    def test_a_posture_is_requested_at_every_target(self, qapp, tmp_path):
+        """Each target asks for a posture, and tilt is asked for repeatedly.
+
+        The model can only correct for head positions calibration observed, so
+        the cues are what put head tilt into the training data at all.
+        """
+        from src.gui.calibration_window import CalibrationWindow
+        from src.tracking.calibration import posture_cue
+
+        config = Config.load(user_path=tmp_path / "c.json")
+        window = CalibrationWindow(config, Rect(0, 0, 1920, 1080), 1, 0)
+        assert window._posture_hint
+        cues = [posture_cue(i) for i in range(len(window._targets))]
+        assert all(cues)
+        assert sum("tilt" in cue.lower() for cue in cues) >= 4
+
+    def test_the_posture_cue_renders_in_both_phases(self, qapp, tmp_path):
+        """It is shown while settling too, so the user can adopt it first."""
+        from PySide6.QtGui import QPixmap
+        from src.gui.calibration_window import (CalibrationWindow, PHASE_COLLECT,
+                                                PHASE_SETTLE)
+
+        config = Config.load(user_path=tmp_path / "c.json")
+        window = CalibrationWindow(config, Rect(0, 0, 800, 600), 1, 0)
+        window.resize(800, 600)
+        for phase in (PHASE_SETTLE, PHASE_COLLECT):
+            for index in range(len(window._targets)):
+                window._phase, window._index = phase, index
+                window.render(QPixmap(800, 600))
+
+    def test_posture_guidance_can_be_turned_off(self, qapp, tmp_path):
+        from PySide6.QtGui import QPixmap
+        from src.gui.calibration_window import CalibrationWindow, PHASE_COLLECT
+
+        config = Config.load(user_path=tmp_path / "c.json")
+        config.set("calibration.posture_guidance", False)
+        window = CalibrationWindow(config, Rect(0, 0, 800, 600), 1, 0)
+        window.resize(800, 600)
+        window._phase = PHASE_COLLECT
+        assert not window._posture_hint
+        window.render(QPixmap(800, 600))
+
+    def test_the_session_uses_the_configured_feature_set(self, qapp, tmp_path):
+        """A profile fitted on features the live pipeline does not produce is
+        silently useless, so the two have to come from the same config key."""
+        from src.gui.calibration_window import CalibrationWindow
+        from src.tracking.features import FEATURE_NAMES
+
+        config = Config.load(user_path=tmp_path / "c.json")
+        window = CalibrationWindow(config, Rect(0, 0, 1920, 1080), 1, 0)
+        names = window._session.feature_names
+        assert names == list(config.get("calibration.model_features"))
+        assert set(names) <= set(FEATURE_NAMES), "config names an unknown feature"
+
 
 class TestBoardSelector:
     def test_square_lock_produces_a_square(self, qapp):

@@ -229,6 +229,46 @@ class TestFitReport:
         assert large.quality() == "GOOD"
 
     def test_dict_round_trip(self):
-        report = FitReport(70.5, 61.0, 183.0, 0.03, [1.0, 2.0], 40.0, 1.0, 260, 13)
+        report = FitReport(70.5, 61.0, 183.0, 0.03, [1.0, 2.0], 45.0, 40.0, 1.0, 260, 13)
         restored = FitReport.from_dict(report.to_dict())
         assert restored.to_dict() == report.to_dict()
+
+    def test_quality_is_rated_on_the_settled_error(self):
+        """The single-frame figure is dominated by noise the filters remove."""
+        report = FitReport(mean_error_px=260.0, median_error_px=40.0,
+                           max_error_px=90.0, mean_error_normalised=260 / 2202,
+                           settled_error_px=50.0)
+        assert report.quality() == "GOOD"
+
+    def test_quality_falls_back_when_no_settled_error_was_recorded(self):
+        """Profiles saved before the settled figure existed still rate sensibly."""
+        assert FitReport(400, 380, 600, 400 / 2202).quality() == "POOR"
+
+
+class TestMarginFraction:
+    """``calibration.margin_fraction`` has to survive being saved."""
+
+    def _fit(self, margin):
+        import numpy as np
+        from src.tracking.gaze_estimator import RidgeGazeEstimator
+        rng = np.random.default_rng(0)
+        raw = rng.normal(0, 0.1, (60, 2))
+        targets = rng.normal(900, 300, (60, 2))
+        groups = np.repeat(np.arange(6), 10)
+        return RidgeGazeEstimator.fit(raw, targets, groups, ["iris_l_ix", "iris_l_iy"],
+                                      (1920, 1080), margin_fraction=margin)
+
+    def test_the_configured_margin_reaches_the_fitted_model(self):
+        assert self._fit(0.4).margin_fraction == pytest.approx(0.4)
+
+    def test_it_survives_serialisation(self):
+        """It used to reset to the default on load, so the setting did nothing."""
+        from src.tracking.gaze_estimator import RidgeGazeEstimator
+        estimator = self._fit(0.4)
+        restored = RidgeGazeEstimator.from_dict(estimator.to_dict())
+        assert restored.margin_fraction == pytest.approx(0.4)
+
+    def test_the_margin_controls_where_predictions_are_clamped(self):
+        wide, narrow = self._fit(0.5), self._fit(0.05)
+        assert wide.clamp_to_screen(10_000.0, 540.0)[0] > \
+            narrow.clamp_to_screen(10_000.0, 540.0)[0]

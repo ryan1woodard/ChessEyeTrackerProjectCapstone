@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -25,6 +25,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from ..utils.config import PROJECT_ROOT
+from .blink import BlinkDetector
 from .features import FeatureVector
 from .gaze_estimator import FitReport, RidgeGazeEstimator
 
@@ -36,6 +37,54 @@ MIN_SAMPLES_PER_POINT = 4
 MIN_POINTS_FOR_FIT = 5
 MAD_THRESHOLD = 3.5
 GROSS_OUTLIER_Z = 12.0
+
+#: Posture asked of the user at each calibration target, in the order the
+#: targets are visited.
+#:
+#: Hoping the user drifts naturally is not enough. The fitted model is only
+#: meaningful over the range of head positions calibration actually observed,
+#: and outside it the estimate is clamped to the edge of that range -- so a
+#: posture never sampled is a posture never compensated for. Someone who sits
+#: rigidly still gives the model no way to tell a tilted head from an upright
+#: one, and in the simulator that costs 235 px of error at a 20-degree tilt
+#: against 36 px upright.
+#:
+#: Tilt appears the most often because it is the axis with the largest effect
+#: and the one users are least likely to vary on their own. Cues alternate
+#: direction so the samples straddle upright rather than sitting to one side,
+#: and every cue is small: this is asking for the range of postures someone
+#: adopts over an evening's play, not for a neck exercise.
+POSTURE_CUES: List[str] = [
+    "Sit as you normally would",
+    "Tilt your head slightly to the left",
+    "Tilt your head slightly to the right",
+    "Lean in a little closer",
+    "Sit back a little",
+    "Tilt your head left again, a bit more",
+    "Sit normally",
+    "Tilt your head right again, a bit more",
+    "Shift a little to your left",
+    "Shift a little to your right",
+    "Tilt your head slightly left",
+    "Tilt your head slightly right",
+    "Sit as you normally would",
+]
+
+#: Features whose range across the calibration samples is worth checking, with
+#: the span (in raw feature units) below which coverage counts as too narrow.
+#: ``eye_tilt`` and ``roll`` are in units of 30 degrees, so 0.3 is 9 degrees of
+#: total spread -- a low bar that a user who tilted at all will clear.
+COVERAGE_TARGETS: Dict[str, float] = {
+    "eye_tilt": 0.30,
+    "roll": 0.30,
+    "head_x": 0.25,
+    "head_z": 0.40,
+}
+
+
+def posture_cue(point_index: int) -> str:
+    """The posture to ask for at a given calibration target."""
+    return POSTURE_CUES[point_index % len(POSTURE_CUES)]
 
 
 # ------------------------------------------------------------------ patterns
@@ -89,6 +138,10 @@ class CalibrationProfile:
     report: Optional[FitReport] = None
     camera_index: int = 0
     pattern: str = "13point"
+    #: Axes the calibration barely varied along, phrased for the user. Saved
+    #: with the profile so the warning can be shown again later, rather than
+    #: only in the dialog that appeared once when the fit finished.
+    coverage_warnings: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict:
         return {
@@ -104,6 +157,7 @@ class CalibrationProfile:
             "report": self.report.to_dict() if self.report else None,
             "camera_index": self.camera_index,
             "pattern": self.pattern,
+            "coverage_warnings": list(self.coverage_warnings),
         }
 
     @classmethod
@@ -121,6 +175,7 @@ class CalibrationProfile:
             report=FitReport.from_dict(data["report"]) if data.get("report") else None,
             camera_index=int(data.get("camera_index", 0)),
             pattern=data.get("pattern", "13point"),
+            coverage_warnings=list(data.get("coverage_warnings", [])),
         )
 
     def build_estimator(self) -> RidgeGazeEstimator:
@@ -132,8 +187,8 @@ class CalibrationProfile:
     def summary(self) -> str:
         if self.report is None:
             return self.name
-        return (f"{self.name} - {self.report.mean_error_px:.0f} px "
-                f"({self.report.quality()})")
+        error = self.report.settled_error_px or self.report.mean_error_px
+        return f"{self.name} - {error:.0f} px ({self.report.quality()})"
 
 
 class CalibrationStore:
@@ -262,6 +317,7 @@ class CalibrationSession:
         max_yaw: float = 40.0,
         max_pitch: float = 30.0,
         min_openness: float = 0.16,
+        margin_fraction: float = 0.15,
     ) -> None:
         self.feature_names = list(feature_names)
         self.screen_size = screen_size
@@ -271,6 +327,12 @@ class CalibrationSession:
         self.max_yaw = max_yaw
         self.max_pitch = max_pitch
         self.min_openness = min_openness
+        self.margin_fraction = margin_fraction
+        #: Shared with the live pipeline so calibration and tracking agree on
+        #: what "eyes closed" means for this user. A fixed threshold rejected
+        #: every frame from anyone whose relaxed eyes read below it, which made
+        #: calibration impossible rather than merely inaccurate.
+        self.blink = BlinkDetector(min_openness)
         self.samples: List[CalibrationSample] = []
         self.rejected = 0
 
@@ -282,7 +344,7 @@ class CalibrationSession:
         if features.head_pose is not None and features.head_pose.valid:
             if features.head_pose.is_extreme(self.max_yaw, self.max_pitch):
                 return False
-        if features.eye_openness < self.min_openness:
+        if self.blink.update(features.eye_openness):
             return False
         array = features.to_array(self.feature_names)
         return bool(np.all(np.isfinite(array)))
@@ -335,8 +397,48 @@ class CalibrationSession:
                 np.array(target_rows, dtype=np.float64),
                 np.array(group_rows, dtype=np.int32))
 
+    def coverage(self) -> Dict[str, float]:
+        """Observed span of each coverage-relevant feature, as a fraction of
+        the span :data:`COVERAGE_TARGETS` asks for.
+
+        A value below 1.0 means calibration never saw enough of that axis for
+        the model to compensate along it. Reported rather than enforced: a
+        narrow calibration is still usable, it is just fragile in a way the
+        user deserves to be told about.
+        """
+        if not self.samples:
+            return {name: 0.0 for name in COVERAGE_TARGETS}
+        matrix = np.array([s.features for s in self.samples], dtype=np.float64)
+        spans = matrix.max(axis=0) - matrix.min(axis=0)
+        result: Dict[str, float] = {}
+        for name, wanted in COVERAGE_TARGETS.items():
+            if name not in self.feature_names:
+                continue
+            observed = float(spans[self.feature_names.index(name)])
+            result[name] = observed / wanted if wanted > 0 else 1.0
+        return result
+
+    def coverage_warnings(self) -> List[str]:
+        """Human-readable notes about axes calibration barely varied along."""
+        labels = {"eye_tilt": "head tilt", "roll": "head tilt",
+                  "head_x": "side-to-side movement",
+                  "head_z": "distance from the screen"}
+        seen, warnings = set(), []
+        for name, ratio in sorted(self.coverage().items()):
+            label = labels.get(name, name)
+            if ratio >= 1.0 or label in seen:
+                continue
+            seen.add(label)
+            warnings.append(
+                f"Very little {label} during calibration; tracking may drift "
+                f"when you {'tilt your head' if label == 'head tilt' else 'move'}."
+            )
+        return warnings
+
     def fit(self) -> RidgeGazeEstimator:
         features, targets, groups = self.build_matrices()
+        for warning in self.coverage_warnings():
+            logger.warning("Calibration coverage: %s", warning)
         distinct = len(np.unique(groups))
         if distinct < MIN_POINTS_FOR_FIT:
             raise ValueError(
@@ -351,6 +453,7 @@ class CalibrationSession:
             screen_origin=self.screen_origin,
             degree=self.degree,
             alphas=self.alphas,
+            margin_fraction=self.margin_fraction,
         )
 
     def to_profile(self, estimator: RidgeGazeEstimator, monitor_index: int,
@@ -371,4 +474,5 @@ class CalibrationSession:
             report=estimator.report,
             camera_index=camera_index,
             pattern=pattern,
+            coverage_warnings=self.coverage_warnings(),
         )
