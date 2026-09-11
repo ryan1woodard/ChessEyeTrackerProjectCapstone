@@ -1,0 +1,100 @@
+{
+  "version": 1,
+  "camera": {
+    "device_index": 0,
+    "width": 1280,
+    "height": 720,
+    "fps": 30,
+    "mirror_preview": true
+  },
+  "tracking": {
+    "backend": "auto",
+    "smoothing_preset": "medium",
+    "one_euro_min_cutoff": 1.0,
+    "one_euro_beta": 0.007,
+    "one_euro_d_cutoff": 1.0,
+    "minimum_confidence": 0.45,
+    "max_head_yaw_deg": 40.0,
+    "max_head_pitch_deg": 30.0,
+    "blink_ear_threshold": 0.16,
+    "eyes_closed_ms": 1200,
+    "sample_log_hz": 10.0,
+    "feature_smoothing": "medium",
+    "blink_recovery_ms": 120
+  },
+  "calibration": {
+    "pattern": "13point",
+    "dwell_ms": 1500,
+    "settle_ms": 800,
+    "samples_per_point": 34,
+    "target_radius_px": 18,
+    "poly_degree": 2,
+    "ridge_alphas": [
+      0.03,
+      0.1,
+      0.3,
+      1.0,
+      3.0,
+      10.0,
+      30.0,
+      100.0,
+      300.0,
+      1000.0,
+      3000.0
+    ],
+    "model_features": [
+      "iris_l_x",
+      "iris_l_y",
+      "iris_r_x",
+      "iris_r_y",
+      "yaw",
+      "pitch",
+      "face_x",
+      "face_y",
+      "face_scale"
+    ],
+    "quality_good_px": 0.0,
+    "quality_fair_px": 0.0,
+    "margin_fraction": 0.15,
+    "head_motion_guidance": true
+  },
+  "screen": {
+    "monitor_index": 1,
+    "analysis_fps": 2.0,
+    "auto_detect_board": true,
+    "board_redetect_seconds": 20.0,
+    "board_orientation": "white_bottom",
+    "board_rect": null
+  },
+  "events": {
+    "away_threshold_ms": 500,
+    "region_dwell_ms": 200,
+    "square_dwell_ms": 250,
+    "min_event_ms": 120,
+    "off_screen_margin_px": 100
+  },
+  "overlay": {
+    "show_gaze_dot": true,
+    "dot_radius": 12,
+    "dot_opacity": 0.75,
+    "dot_color": "#ff2d2d",
+    "show_debug_overlay": false,
+    "show_board_rect": false,
+    "show_region_rects": false,
+    "show_heatmap": false,
+    "heatmap_mode": "both",
+    "heatmap_opacity": 0.55,
+    "heatmap_sigma_px": 55.0,
+    "heatmap_half_life_s": 0.0,
+    "heatmap_refresh_s": 0.4,
+    "heatmap_reset_per_session": true
+  },
+  "ui": {
+    "minimize_to_tray": true,
+    "start_minimized": false,
+    "first_run_completed": false
+  },
+  "privacy": {
+    "store_gaze_samples": true
+  }
+}

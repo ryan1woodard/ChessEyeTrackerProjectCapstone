@@ -1,0 +1,22 @@
+# Core application dependencies (Windows 10-11, Python 3.11+)
+
+PySide6>=6.6,<7
+opencv-contrib-python>=4.9
+numpy>=1.26,<3
+mss>=9.0
+matplotlib>=3.8
+
+# MediaPipe packaging changed mid-2024. Up to 0.10.14 the `mediapipe.solutions`
+# API ships its models inside the wheel, so face tracking works fully offline.
+# Newer releases removed `solutions` entirely and the replacement Tasks API
+# needs a ~3.8 MB model file fetched once from Google.
+#
+# 0.10.14 is pinned where a wheel exists, because it needs no download at all.
+# On Python 3.13+ there is no 0.10.14 wheel, so a newer MediaPipe is used and
+# the model is downloaded automatically on first run.
+mediapipe==0.10.14; python_version < "3.13"
+mediapipe>=0.10.30; python_version >= "3.13"
+
+# Development / packaging (optional)
+pytest>=8.0
+pyinstaller>=6.4
