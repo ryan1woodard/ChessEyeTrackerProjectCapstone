@@ -460,17 +460,24 @@ class MainWindow(QMainWindow):
                 "Webcam gaze tracking is an estimate, not a measurement."
             )
             if profile.coverage_warnings:
-                message += "\n\n" + "\n".join(profile.coverage_warnings)
-                message += ("\nRe-running calibration and following the posture\n"
-                            "prompts more closely will fix this.")
+                message += "\n\nWhat went wrong:\n\n"
+                message += "\n\n".join(f"- {note}" for note in profile.coverage_warnings)
         else:
             message = "Calibration finished."
 
         if quality == "POOR":
             box = QMessageBox(self)
             box.setWindowTitle("Calibration quality is low")
-            box.setText(message + "\n\nAccuracy at this level may not resolve individual "
-                                  "squares reliably.")
+            advice = ("\n\nAccuracy at this level may not resolve individual squares "
+                      "reliably.")
+            if not profile.coverage_warnings:
+                # Nothing specific was detectable, so say what usually helps
+                # rather than leaving the user with a verdict and no next step.
+                advice += ("\n\nWhat usually helps, in order: more light on your face "
+                           "from the front; the webcam at the top centre of the screen; "
+                           "sitting 50-70 cm away; and keeping your head moving at every "
+                           "dot rather than holding still.")
+            box.setText(message + advice)
             again = box.addButton("Calibrate Again", QMessageBox.AcceptRole)
             box.addButton("Use Anyway", QMessageBox.RejectRole)
             box.exec()

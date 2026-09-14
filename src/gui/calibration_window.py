@@ -38,9 +38,9 @@ from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QKeyEvent, QPainter, QPen
 from PySide6.QtWidgets import QWidget
 
-from ..tracking.calibration import (CalibrationSession, Posture,
-                                    calibration_pattern, pattern_to_pixels,
-                                    posture)
+from ..tracking.calibration import (DEFAULT_METHOD, METHODS, CalibrationSession,
+                                    PoseCoverage, Posture, calibration_pattern,
+                                    pattern_to_pixels, posture)
 from ..tracking.pipeline import GazeSample
 from ..utils.config import Config
 from ..utils.geometry import Rect
@@ -116,6 +116,13 @@ class CalibrationWindow(QWidget):
         #: How long the tilt must sit within tolerance before moving on.
         self._pose_hold_ms = int(config.get("calibration.posture_hold_ms", 500))
         self._pose_tolerance = float(config.get("calibration.posture_tolerance_deg", 6.0))
+        method = str(config.get("calibration.method", DEFAULT_METHOD))
+        self._method = method if method in METHODS else DEFAULT_METHOD
+        #: How long each dot gets in the explore method.
+        self._explore_ms = int(config.get("calibration.explore_ms", 5000))
+        #: Never leave a dot before this, even if coverage completes at once.
+        self._explore_min_ms = int(config.get("calibration.explore_min_ms", 2500))
+        self._coverage = PoseCoverage()
 
         self._index = 0
         self._phase = PHASE_INTRO
@@ -204,9 +211,11 @@ class CalibrationWindow(QWidget):
                 self._rest_samples.append((self._head_x, self._head_z))
         else:
             self._head_x = self._head_z = None
+        if self._phase == PHASE_COLLECT and self.exploring and self._head_roll is not None:
+            self._coverage.observe(self._head_roll)
         if self._phase != PHASE_COLLECT or sample.features is None:
             return
-        if self._collected >= self._quota:
+        if not self.exploring and self._collected >= self._quota:
             return
         target = self._targets[self._index]
         if self._session.add(self._index, target, sample.features):
@@ -228,10 +237,25 @@ class CalibrationWindow(QWidget):
                 self._phase_elapsed = 0
                 self._collected = 0
         elif self._phase == PHASE_COLLECT:
-            done = self._collected >= self._quota or self._phase_elapsed >= self._dwell_ms
-            if done:
+            if self._collect_finished():
                 self._finish_point()
         self.update()
+
+    def _collect_finished(self) -> bool:
+        """Whether this dot has had enough.
+
+        The two methods stop on different things. Holding a posture, what
+        matters is the sample count -- every frame is near enough the same
+        pose, so more of them adds little. Exploring, what matters is the
+        *range* covered, so the dot stays until the head has been round it or
+        the time runs out.
+        """
+        if not self.exploring:
+            return (self._collected >= self._quota
+                    or self._phase_elapsed >= self._dwell_ms)
+        if self._phase_elapsed < self._explore_min_ms:
+            return False
+        return self._coverage.complete or self._phase_elapsed >= self._explore_ms
 
     def _tick_pose(self) -> None:
         """Wait for the posture, but never wait forever.
@@ -305,12 +329,21 @@ class CalibrationWindow(QWidget):
         # than to a number: most of the way there is the whole point.
         return progress is not None and progress >= 0.6
 
+    @property
+    def exploring(self) -> bool:
+        """Whether this run asks the head to roam rather than hold a posture."""
+        return self._method == "explore"
+
     def _begin_point(self, index: int) -> None:
         self._index = index
-        self._phase = PHASE_POSE if self._posture_hint else PHASE_SETTLE
+        # Explore has nothing to pose for: the instruction is the same at every
+        # dot, so a phase spent reading it would be a phase spent not moving.
+        wants_pose = self._posture_hint and not self.exploring
+        self._phase = PHASE_POSE if wants_pose else PHASE_SETTLE
         self._phase_elapsed = 0
         self._held_ms = 0
         self._collected = 0
+        self._coverage.reset()
 
     def _finish_point(self) -> None:
         usable = self._session.count_for_point(self._index)
@@ -348,6 +381,14 @@ class CalibrationWindow(QWidget):
             self._cancel()
         elif event.key() == Qt.Key_Space and self._phase == PHASE_INTRO:
             self._begin_point(0)
+        elif event.key() == Qt.Key_M and self._phase == PHASE_INTRO:
+            # Offered here rather than buried in Settings: this is the moment
+            # the choice is about to matter, and the screen explaining the two
+            # is already in front of the user.
+            index = METHODS.index(self._method)
+            self._method = METHODS[(index + 1) % len(METHODS)]
+            logger.info("Calibration method set to %s", self._method)
+            self.update()
         elif event.key() == Qt.Key_Space and self._phase == PHASE_POSE:
             # For the user who has the posture and does not want to wait.
             self._phase = PHASE_SETTLE
@@ -373,35 +414,75 @@ class CalibrationWindow(QWidget):
         elif self._phase in (PHASE_SETTLE, PHASE_COLLECT):
             self._paint_target(painter)
             self._paint_status(painter)
-            self._paint_posture_reminder(painter)
+            if self.exploring:
+                self._paint_explore_prompt(painter)
+            else:
+                self._paint_posture_reminder(painter)
         painter.end()
 
     def _paint_intro(self, painter: QPainter) -> None:
         painter.setPen(QPen(_INK))
         painter.setFont(QFont("Segoe UI", 30, QFont.DemiBold))
-        painter.drawText(self.rect().adjusted(0, -170, 0, -170), Qt.AlignCenter,
-                         "Calibration")
+        painter.drawText(QRectF(0, self.height() * 0.10, self.width(), 50),
+                         Qt.AlignCenter, "Calibration")
 
         painter.setFont(QFont("Segoe UI", 15))
         painter.setPen(QPen(_MUTED))
-        lines = (
+        # Down to the key hints, not a fraction of the height: the explore
+        # text is long enough that a fixed fraction silently clipped its last
+        # line, which was the one saying how long the whole thing takes.
+        top = self.height() * 0.20
+        painter.drawText(QRectF(0, top, self.width(), self.height() - 140 - top),
+                         Qt.AlignHCenter | Qt.AlignTop, self._intro_text())
+
+        painter.setPen(QPen(_ACCENT))
+        painter.setFont(QFont("Segoe UI", 14, QFont.DemiBold))
+        painter.drawText(QRectF(0, self.height() - 120, self.width(), 26), Qt.AlignCenter,
+                         f"M switches method  -  now: {self._method_name()}")
+        painter.setPen(QPen(_MUTED))
+        painter.setFont(QFont("Segoe UI", 14))
+        painter.drawText(QRectF(0, self.height() - 88, self.width(), 26), Qt.AlignCenter,
+                         "Space to begin  -  R to redo a point  -  Esc to cancel")
+
+    def _method_name(self) -> str:
+        return ("Move your head (recommended)" if self.exploring
+                else "Hold a posture (quicker)")
+
+    def _intro_text(self) -> str:
+        if self.exploring:
+            return (
+                "Look straight at each dot and keep looking at it.\n\n"
+                "While you look, keep your head moving: roll it slowly from\n"
+                "side to side, lean in and back, shift a little left and right.\n"
+                "Do not try to hold still, and do not try to hit any particular\n"
+                "position -- just keep moving, gently, the whole time.\n\n"
+                "A ring around each dot fills in as your head covers new\n"
+                "angles. When it is full the dot moves on. You never need to\n"
+                "look away from the dot to check it.\n\n"
+                "This is what teaches the tracker to tell head movement apart\n"
+                "from eye movement. If your head sits in the same place at\n"
+                "every dot, the two look identical to it, and tracking falls\n"
+                "apart the first time you move during a game.\n\n"
+                f"{len(self._targets)} points, about {self._estimated_seconds():.0f} seconds."
+            )
+        return (
             "Each point has two parts.\n\n"
             "First you are asked to sit a certain way -- tilt your head a\n"
-            "little to one side, lean in, sit back. Take your time over this:\n"
-            "nothing is being recorded yet, and a gauge shows you when you\n"
-            "have it right.\n\n"
-            "Then a red dot appears. Look straight at it, keep holding the\n"
-            "posture, and keep looking until its ring fills.\n\n"
-            "The postures are what let the tracker follow you when you shift\n"
-            "during a game. Every one of them is small.\n\n"
+            "little to one side, lean in, sit back. Nothing is recorded yet,\n"
+            "and a gauge shows when you have it.\n\n"
+            "Then a red dot appears. Look straight at it and keep looking\n"
+            "until its ring fills. Hold the posture, but stay relaxed and let\n"
+            "your head drift gently -- holding rigidly still is what makes a\n"
+            "calibration fragile.\n\n"
             "Sit at your normal playing distance.\n\n"
-            f"{len(self._targets)} points, about {self._estimated_seconds():.0f} seconds.\n\n"
-            "Space to begin now  -  R to redo a point  -  Esc to cancel"
+            f"{len(self._targets)} points, about {self._estimated_seconds():.0f} seconds."
         )
-        painter.drawText(self.rect().adjusted(0, 60, 0, 60), Qt.AlignCenter, lines)
 
     def _estimated_seconds(self) -> float:
-        per_point = self._pose_min_ms + self._settle_ms + self._dwell_ms
+        if self.exploring:
+            per_point = self._settle_ms + (self._explore_min_ms + self._explore_ms) / 2
+        else:
+            per_point = self._pose_min_ms + self._settle_ms + self._dwell_ms
         return len(self._targets) * per_point / 1000.0
 
     # ------------------------------------------------------------ pose phase
@@ -595,6 +676,44 @@ class CalibrationWindow(QWidget):
         painter.setBrush(_GOOD if self.posture_held else _INK)
         painter.drawEllipse(marker, track * 0.62, track * 0.62)
 
+    def _paint_explore_prompt(self, painter: QPainter) -> None:
+        """One line of instruction, the same at every dot so it need not be reread.
+
+        Placed along the bottom rather than beside the dot because unlike the
+        posture reminder it does not change, and a sentence that never changes
+        stops being read after the first dot -- which is the point. The ring
+        round the dot is what carries the moment-to-moment feedback.
+        """
+        painter.setPen(QPen(_ACCENT if self._face_present else _WARN))
+        painter.setFont(QFont("Segoe UI", 15, QFont.DemiBold))
+        message = ("Face not detected - check your lighting and camera"
+                   if not self._face_present else
+                   "Eyes on the dot - now roll your head slowly side to side, "
+                   "and lean in and back")
+        painter.drawText(QRectF(0, self.height() - 108, self.width(), 30),
+                         Qt.AlignCenter, message)
+
+    def _paint_coverage_ring(self, painter: QPainter, centre: QPointF,
+                             radius: float) -> None:
+        """The head tilts seen so far at this dot, as segments round the dot.
+
+        Drawn concentric with the target on purpose. The user has to keep
+        looking at the dot, so anything they need to check has to be readable
+        without moving their eyes -- a ring around the thing they are already
+        staring at is the only place that is true of.
+        """
+        bins = self._coverage.bins
+        gap = 360.0 / bins * 0.22
+        span = 360.0 / bins - gap
+        box = QRectF(centre.x() - radius, centre.y() - radius, radius * 2, radius * 2)
+        for index, seen in enumerate(self._coverage.seen):
+            # Bin 0 is the largest leftward tilt; lay them out so rolling the
+            # head one way lights the ring that way round.
+            start = 180.0 - (index + 0.5) * (360.0 / bins) - span / 2
+            painter.setPen(QPen(_GOOD if seen else QColor(64, 72, 86),
+                                5 if seen else 3, Qt.SolidLine, Qt.RoundCap))
+            painter.drawArc(box, int(start * 16), int(span * 16))
+
     def _paint_posture_reminder(self, painter: QPainter) -> None:
         """A compact reminder beside the dot, once the dot is what matters.
 
@@ -636,12 +755,18 @@ class CalibrationWindow(QWidget):
         painter.drawEllipse(center, outer, outer)
 
         if self._phase == PHASE_COLLECT:
-            progress = min(1.0, self._collected / max(self._quota, 1))
-            painter.setBrush(Qt.NoBrush)
-            painter.setPen(QPen(QColor(80, 220, 140), 4, Qt.SolidLine, Qt.RoundCap))
-            span = int(-progress * 360 * 16)
-            painter.drawArc(int(center.x() - outer), int(center.y() - outer),
-                            int(outer * 2), int(outer * 2), 90 * 16, span)
+            if self.exploring:
+                # Coverage, not sample count: the dot is finished when the head
+                # has been round it, and a plain progress bar would say nothing
+                # about whether the moving is happening.
+                self._paint_coverage_ring(painter, center, outer * 1.35)
+            else:
+                progress = min(1.0, self._collected / max(self._quota, 1))
+                painter.setBrush(Qt.NoBrush)
+                painter.setPen(QPen(QColor(80, 220, 140), 4, Qt.SolidLine, Qt.RoundCap))
+                span = int(-progress * 360 * 16)
+                painter.drawArc(int(center.x() - outer), int(center.y() - outer),
+                                int(outer * 2), int(outer * 2), 90 * 16, span)
 
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor(255, 60, 60))

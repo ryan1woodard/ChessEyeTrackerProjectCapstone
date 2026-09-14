@@ -17,14 +17,17 @@ caught here.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pytest
 
 from src.tracking.blink import BlinkDetector
-from src.tracking.calibration import (COVERAGE_TARGETS, CalibrationSession,
-                                      calibration_pattern,
+from src.tracking.calibration import (COVERAGE_TARGETS, MAX_TARGET_CORRELATION,
+                                      EXPLORE_ROLL_RANGE, CalibrationSession,
+                                      PoseCoverage, calibration_pattern,
                                       gaze_feature_columns, pattern_to_pixels,
-                                      posture_cue, robust_filter)
+                                      posture, posture_cue, robust_filter)
 from src.tracking import face_tracker as fl
 from src.tracking.face_frame import fit_face_frame
 from src.tracking.face_tracker import FaceLandmarks
@@ -54,6 +57,17 @@ LEGACY_FEATURES = ["iris_l_x", "iris_l_y", "iris_r_x", "iris_r_y",
 
 ALPHAS = [0.03, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0, 100.0, 300.0, 1000.0, 3000.0]
 PROBES = probe_targets(SCREEN, grid=3)
+
+#: Head positions a calibration has to survive, used where the question is how
+#: well one generalises rather than how it does where it was recorded.
+HARD_POSES = [
+    ("neutral", HeadState()),
+    ("tilt +18", HeadState(roll_deg=18)),
+    ("tilt -18", HeadState(roll_deg=-18)),
+    ("lean in", HeadState(z=540)),
+    ("sit back", HeadState(z=690)),
+    ("shift left", HeadState(x=-50)),
+]
 
 
 def _calibrate(simulator: EyeSimulator, features, rng: np.random.Generator,
@@ -992,6 +1006,188 @@ class TestCalibrationCoverage:
         warnings = session.coverage_warnings()
         assert warnings, "a perfectly still calibration should be flagged"
         assert any("tilt" in w for w in warnings)
+
+
+class TestCalibrationDiagnosis:
+    """A verdict of POOR with no reason is not something a user can act on."""
+
+    @staticmethod
+    def _roaming(simulator, rng, effort=1.0, seconds=5.0):
+        """A calibration where the head moves at every dot."""
+        session = CalibrationSession(FEATURES, SCREEN, alphas=ALPHAS)
+        targets = pattern_to_pixels(calibration_pattern("13point"), *SCREEN)
+        for point_id, target in enumerate(targets):
+            phase = rng.uniform(0.0, 6.0)
+            for frame in range(int(seconds * FPS)):
+                moment = phase + frame / FPS
+                head = HeadState(
+                    x=34 * effort * math.sin(2 * math.pi * moment / 2.9),
+                    y=60 + 18 * effort * math.sin(2 * math.pi * moment / 3.7 + 1.0),
+                    z=600 + 55 * effort * math.sin(2 * math.pi * moment / 4.3 + 2.0),
+                    roll_deg=17 * effort * math.sin(2 * math.pi * moment / 2.0 + 0.3))
+                session.add(point_id, target, simulator.features(target, head))
+        return session
+
+    @staticmethod
+    def _one_pose_per_dot(simulator, rng, drift=1.0):
+        """A calibration that holds a different fixed posture at each dot."""
+        session = CalibrationSession(FEATURES, SCREEN, alphas=ALPHAS)
+        targets = pattern_to_pixels(calibration_pattern("13point"), *SCREEN)
+        for point_id, target in enumerate(targets):
+            wanted = posture(point_id)
+            for _ in range(26):
+                head = HeadState(roll_deg=wanted.roll_deg,
+                                 z=600 * (1 + 0.12 * wanted.lean),
+                                 x=-47 * wanted.shift).shifted(
+                    dx=rng.normal(0, 6 * drift), dy=rng.normal(0, 5 * drift),
+                    dz=rng.normal(0, 8 * drift), droll=rng.normal(0, 1.5 * drift))
+                session.add(point_id, target, simulator.features(target, head))
+        return session
+
+    def test_a_good_calibration_says_nothing(self, simulator):
+        session = self._roaming(simulator, np.random.default_rng(3))
+        assert session.diagnose().warnings == []
+
+    def test_a_still_head_is_caught(self, simulator):
+        """The failure that matters: it looks fine and is not."""
+        session = self._roaming(simulator, np.random.default_rng(3), effort=0.25)
+        diagnosis = session.diagnose()
+        assert diagnosis.warnings, "a barely-moving calibration passed silently"
+        assert any("barely moved" in note for note in diagnosis.warnings)
+
+    def test_coverage_is_per_dot_not_pooled(self, simulator):
+        """Holding a different posture at each dot is one of the worst cases.
+
+        Pooled over the whole calibration it looks excellent -- plenty of tilt
+        overall -- while being precisely the arrangement that lets the model
+        read the dot off the head. Only a per-dot measure can tell them apart.
+        """
+        rigid = self._one_pose_per_dot(simulator, np.random.default_rng(3), drift=1.0)
+        roaming = self._roaming(simulator, np.random.default_rng(3))
+
+        # Pooled, the rigid one looks like it moved plenty.
+        def pooled_span(session, name):
+            index = session.feature_names.index(name)
+            return float(np.ptp([s.features[index] for s in session.samples]))
+
+        assert pooled_span(rigid, "eye_tilt") > pooled_span(roaming, "eye_tilt")
+        # Per dot, which is what the model actually needs, it did not.
+        assert rigid.coverage()["eye_tilt"] < 0.7
+        assert roaming.coverage()["eye_tilt"] >= 1.0
+        assert rigid.diagnose().warnings
+
+    def test_a_confounded_calibration_is_named_as_such(self, simulator):
+        """Head position that gives away the dot is its own kind of wrong."""
+        session = CalibrationSession(FEATURES, SCREEN, alphas=ALPHAS)
+        targets = pattern_to_pixels(calibration_pattern("13point"), *SCREEN)
+        for point_id, target in enumerate(targets):
+            for _ in range(20):
+                # Tilt tied to where the dot is vertically.
+                head = HeadState(roll_deg=(target[1] / SCREEN[1] - 0.5) * 44)
+                session.add(point_id, target, simulator.features(target, head))
+        diagnosis = session.diagnose()
+        assert diagnosis.target_correlation > MAX_TARGET_CORRELATION
+        assert any("gave away which dot" in note for note in diagnosis.warnings)
+
+    def test_the_counts_are_reported(self, simulator):
+        session = self._roaming(simulator, np.random.default_rng(3), seconds=2.0)
+        diagnosis = session.diagnose()
+        assert diagnosis.points_kept == diagnosis.points_attempted == 13
+        assert diagnosis.samples_per_point > 20
+
+    def test_dropped_points_are_reported(self, simulator):
+        """Losing dots is usually lighting, and the user should hear so."""
+        session = CalibrationSession(FEATURES, SCREEN, alphas=ALPHAS)
+        targets = pattern_to_pixels(calibration_pattern("13point"), *SCREEN)
+        rng = np.random.default_rng(3)
+        for point_id, target in enumerate(targets):
+            wanted = 20 if point_id < 10 else 2      # three dots barely sampled
+            for _ in range(wanted):
+                head = HeadState().shifted(dx=rng.normal(0, 28), droll=rng.normal(0, 8))
+                session.add(point_id, target, simulator.features(target, head))
+        diagnosis = session.diagnose()
+        assert diagnosis.points_kept == 10
+        assert any("were dropped" in note for note in diagnosis.warnings)
+
+    def test_the_diagnosis_rides_along_with_the_profile(self, simulator):
+        """So the warning can be shown again, not only in a dialog that passed."""
+        session = self._roaming(simulator, np.random.default_rng(3), effort=0.25)
+        profile = session.to_profile(session.fit(), 1, 0, "13point")
+        assert profile.coverage_warnings
+        restored = type(profile).from_dict(profile.to_dict())
+        assert restored.coverage_warnings == profile.coverage_warnings
+
+
+class TestCalibrationMethods:
+    """Both ways of collecting a calibration have to actually work."""
+
+    def test_explore_beats_a_rigidly_held_posture(self, simulator):
+        """The reason explore is the default.
+
+        Holding one posture per dot ties head position to screen position; the
+        head roaming at every dot unties them, and the error halves.
+        """
+        diag = TestCalibrationDiagnosis()
+        rigid = diag._one_pose_per_dot(simulator, np.random.default_rng(3), drift=1.0)
+        roaming = diag._roaming(simulator, np.random.default_rng(3))
+
+        # Scored across head positions, not just the one it was sat in. At a
+        # neutral pose the rigid calibration looks almost as good; the whole
+        # difference is what happens once the user moves, which is the point.
+        def across_poses(estimator):
+            return float(np.mean([_mean_error(estimator, simulator, head)
+                                  for _label, head in HARD_POSES]))
+
+        rigid_error = across_poses(rigid.fit())
+        roaming_error = across_poses(roaming.fit())
+        assert roaming_error < rigid_error * 0.8, (
+            f"rigid {rigid_error:.0f} px, roaming {roaming_error:.0f} px")
+
+    def test_a_held_posture_is_fine_if_the_head_still_drifts(self, simulator):
+        """So the quicker method stays worth offering.
+
+        What ruins it is rigidity, not the posture: told to hold a tilt but
+        stay relaxed, it lands in the same place as explore.
+        """
+        diag = TestCalibrationDiagnosis()
+        drifting = diag._one_pose_per_dot(simulator, np.random.default_rng(3), drift=4.0)
+        error = _mean_error(drifting.fit(), simulator, HeadState())
+        assert error < 60, f"{error:.0f} px"
+        assert drifting.diagnose().warnings == []
+
+    def test_every_method_name_is_one_the_window_understands(self):
+        from src.tracking.calibration import DEFAULT_METHOD, METHODS
+        assert DEFAULT_METHOD in METHODS
+        assert set(METHODS) == {"explore", "postures"}
+
+
+class TestPoseCoverage:
+    def test_a_still_head_covers_one_bin(self):
+        coverage = PoseCoverage()
+        for _ in range(50):
+            coverage.observe(0.0)
+        assert coverage.fraction == pytest.approx(1 / coverage.bins)
+        assert not coverage.complete
+
+    def test_sweeping_the_range_completes_it(self):
+        coverage = PoseCoverage()
+        for roll in np.linspace(-EXPLORE_ROLL_RANGE, EXPLORE_ROLL_RANGE, 40):
+            coverage.observe(float(roll))
+        assert coverage.complete
+
+    def test_tilts_beyond_the_range_are_ignored(self):
+        """Otherwise one wild movement would fill the ring and end the dot."""
+        coverage = PoseCoverage()
+        for roll in (90.0, -90.0, float("nan"), 1e6):
+            coverage.observe(roll)
+        assert coverage.fraction == 0.0
+
+    def test_reset_clears_it_between_dots(self):
+        coverage = PoseCoverage()
+        for roll in np.linspace(-EXPLORE_ROLL_RANGE, EXPLORE_ROLL_RANGE, 40):
+            coverage.observe(float(roll))
+        coverage.reset()
+        assert coverage.fraction == 0.0
 
 
 class TestFitReport:

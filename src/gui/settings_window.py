@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QSpinBox, QTabWidget, QTextEdit, QVBoxLayout, QWidget)
 
 from ..utils.screens import ScreenInfo
+from ..tracking.calibration import DEFAULT_METHOD, METHODS
 from ..tracking.camera import CameraInfo
 from ..tracking.smoother import SMOOTHING_PRESETS
 from ..utils.config import Config
@@ -115,6 +116,20 @@ class SettingsWindow(QDialog):
         page = QWidget()
         form = QFormLayout(page)
 
+        self.calibration_method_combo = QComboBox()
+        for method, hint in (
+            ("explore", "Move your head at each dot - recommended"),
+            ("postures", "Hold a posture at each dot - quicker"),
+        ):
+            if method in METHODS:
+                self.calibration_method_combo.addItem(hint, method)
+        self._select_data(self.calibration_method_combo,
+                          str(self._config.get("calibration.method", DEFAULT_METHOD)))
+        self.calibration_method_combo.setToolTip(
+            "How calibration collects its samples. Moving your head at every dot "
+            "is what lets the tracker tell head movement from eye movement; "
+            "holding a posture is faster but only works if you stay relaxed.")
+
         self.smoothing_combo = QComboBox()
         for preset, hint in (("off", "Off - raw, very jittery"),
                              ("low", "Low - fastest response"),
@@ -161,6 +176,7 @@ class SettingsWindow(QDialog):
         self.eyes_closed_spin.setSuffix(" ms")
         self.eyes_closed_spin.setValue(int(self._config.get("tracking.eyes_closed_ms", 1200)))
 
+        form.addRow("Calibration method:", self.calibration_method_combo)
         form.addRow("Smoothing:", self.smoothing_combo)
         form.addRow("Minimum confidence:", self.confidence_spin)
         form.addRow("Look-away threshold:", self.away_spin)
@@ -293,6 +309,7 @@ class SettingsWindow(QDialog):
         cfg.set("camera.mirror_preview", self.mirror_check.isChecked())
 
         cfg.set("tracking.smoothing_preset", self.smoothing_combo.currentData())
+        cfg.set("calibration.method", self.calibration_method_combo.currentData())
         cfg.set("tracking.minimum_confidence", self.confidence_spin.value())
         cfg.set("tracking.eyes_closed_ms", self.eyes_closed_spin.value())
         cfg.set("tracking.blink_recovery_ms", self.blink_recovery_spin.value())

@@ -67,7 +67,10 @@
     "posture_ms": 3500,
     "posture_min_ms": 1500,
     "posture_hold_ms": 500,
-    "posture_tolerance_deg": 6.0
+    "posture_tolerance_deg": 6.0,
+    "method": "explore",
+    "explore_ms": 5000,
+    "explore_min_ms": 2500
   },
   "screen": {
     "monitor_index": 1,

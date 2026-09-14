@@ -121,35 +121,45 @@ python app.py --monitor 2     # track the second monitor
 
 ### 1. Calibrate
 
-Press **Start Tracking**, then **Calibrate**. A full-screen window works
-through 13 points, and each one has two parts.
+Press **Start Tracking**, then **Calibrate**. There are two ways to do it, and
+`M` on the intro screen switches between them (it is in Settings too).
 
-**First you are asked to sit a certain way.** Tilt your head a little to one
-side, lean in, sit back. No dot is on screen for this part and nothing is being
-recorded, so there is time to read the instruction and act on it. A gauge shows
-your actual head tilt against the one being asked for -- move until the white
-line sits inside the blue band -- and the prompt turns green when you have it.
-The countdown says exactly when the dot will arrive, and `Space` skips ahead if
-you already have the posture.
+#### Move your head (the default)
 
-Leaning and shifting are measured too, against your own resting position rather
-than against a fixed number, so those get a gauge as well. Nothing claims you
-have a posture right unless it was actually measured.
+Look straight at each dot and **keep looking at it**, while your head keeps
+moving: roll it slowly side to side, lean in and back, shift a little left and
+right. Do not try to hold still, and do not try to hit any particular position.
+Just keep moving, gently, the whole time.
 
-**Then a red dot appears.** Look straight at it, keep holding the posture, and
-keep looking until its ring fills. The prompt shrinks to a small gauge beside
-the dot, close enough to catch out of the corner of your eye without looking
-away -- a glance at an instruction is a wasted sample.
+A ring around each dot fills in as your head covers new angles, and the dot
+moves on when it is full -- so the feedback is on the dot you are already
+staring at, and you never look away to check it. About a minute in total.
 
-The tracker can only correct for head positions it has actually observed, which
-is what all of this is for. A calibration recorded sitting rigidly still
-contains no information about how head movement and eye movement trade off, so
-the moment you tilt your head or shift in your chair the estimate degrades
-badly. Measured against the simulator, a 20 degree head tilt costs **238 px** of
-error after a still calibration and **22 px** after one that followed the
-prompts. Every posture asked for is a small one -- 12 degrees is a glance at a
-clock on the wall, and 20 is the most you are asked for. Sit at your normal
-playing distance.
+#### Hold a posture (quicker)
+
+Each point first asks you to sit a certain way, with a gauge showing when you
+have it, and then shows the dot. **Stay relaxed while you hold it** and let your
+head drift; holding rigidly still is what makes this method fragile. About 55
+seconds.
+
+#### Why any of this
+
+The tracker has to tell head movement apart from eye movement, and it can only
+learn that from seeing both at the same dot. If your head is in the same place
+every time you look at a given dot, the two are indistinguishable -- the model
+will happily read the dot off your head position, which works perfectly during
+calibration and falls apart the first time you move during a game.
+
+Measured in the simulator, the same 13 points collected four ways:
+
+| how the head was held | error |
+|---|---|
+| roaming at every dot | 25 px |
+| posture held, still drifting | 23 px |
+| posture held rigidly still | 42 px |
+| barely moving at all | 66 px |
+
+Moving your head is not a courtesy to the software. It is the measurement.
 
 Press `R` during a target to redo it, or `Esc` to cancel.
 
@@ -171,9 +181,12 @@ it and then asked to predict it, so the error estimates accuracy at screen
 positions the model has never seen. A training-set error would look far better
 and mean nothing.
 
-If the report adds a note about seeing very little head tilt or movement, the
-prompts were not followed closely enough; recalibrating and following them will
-fix it.
+If anything was wrong with the collection, the report says what rather than
+just rating it. It checks how much your head moved **at each individual dot**
+(not pooled over the whole run, which cannot tell a good calibration from one
+that held a different fixed posture at every dot), how many dots and samples
+survived, and whether your head position gave away which dot you were looking
+at. Each of those is something you can act on.
 
 If quality comes back POOR you are offered **Calibrate Again** or **Use
 Anyway**.
@@ -394,20 +407,50 @@ error of the best is chosen. With only 13 points the minimum is noisy, and the
 simpler model extrapolates far better outside the calibrated region -- which is
 where a gaze tracker spends most of its time.
 
-**Calibration asks for specific postures, one per target.** Because the camera
-sees eye rotation relative to the *head*, head rotation and eye rotation trade
-off against each other: the same iris offset points at different screen
-positions depending on where the head is. A calibration recorded at one fixed
-pose contains no information about that trade-off, and predictions outside the
-range it observed are clamped to the edge of that range -- so a posture never
-sampled is a posture never compensated for.
+**Calibration has to decorrelate head position from screen position.** Because
+the camera sees eye rotation relative to the *head*, head rotation and eye
+rotation trade off against each other: the same iris offset points at different
+screen positions depending on where the head is. A calibration recorded at one
+fixed pose contains no information about that trade-off, and predictions
+outside the range it observed are clamped to the edge of that range.
 
-Earlier versions asked the user to "let your head drift gently" and hoped. That
-is not reliable enough, least of all for tilt, which people do not vary on
-their own. Each target now names a posture instead -- tilt left, tilt right,
-lean in, sit back -- so the training data covers the axes that matter by
-construction. The session reports which axes it saw too little of, and the
-result dialog passes that on.
+Worse than containing no information is containing misleading information. If
+the head sits in a characteristic place for each dot, head position *predicts*
+which dot is being looked at, and the fit will use it -- scoring beautifully on
+its own data and collapsing the moment the user moves. An earlier version of
+this asked for one held posture per dot and did exactly that: measured against
+the simulator it cost 42 px against 23 px for the same postures held less
+rigidly, and the correlation between head features and target position was 0.33
+against 0.06 for a calibration where the head roams at every dot.
+
+The default method therefore asks the user to keep moving at every dot rather
+than to adopt a pose, which unties the two by construction and is also a much
+easier instruction to follow correctly. The posture method remains for people
+who want it faster.
+
+**Coverage is checked per dot, not pooled.** The distinction is the whole value
+of the check. A run that holds a different fixed posture at each dot shows
+plenty of head movement overall while being one of the worst arrangements
+there is. Measured per dot, it does not:
+
+| how the head was held | error | per-dot span | pooled span |
+|---|---|---|---|
+| roaming at every dot | 25 px | 1.22 | 1.28 |
+| posture held, still drifting | 23 px | 0.88 | 2.21 |
+| posture held rigidly | 42 px | 0.23 | 1.55 |
+| barely moving at all | 66 px | 0.38 | 0.42 |
+
+The per-dot column orders with the error. The pooled one rates the 42 px case
+above the 25 px one.
+
+**The report says what went wrong, not just how bad it was.** "POOR" on its own
+is not something a user can act on. The fit reports per-dot coverage on each
+axis, how many dots and samples survived, and the strongest correlation between
+a head feature and target position -- each of which maps to a specific thing to
+do differently. This matters more than it sounds: a calibration where the user
+barely moved reports a *low* cross-validated error, because every held-out dot
+was recorded in the same narrow range as the rest, and looks excellent while
+being three times worse in use.
 
 **The regularisation is chosen against single frames, not their average.**
 Leave-one-point-out cross-validation used to score the *mean* of the held-out

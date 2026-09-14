@@ -142,16 +142,130 @@ POSTURES: List[Posture] = [
     Posture("Sit as you normally would"),
 ]
 
-#: Features whose range across the calibration samples is worth checking, with
-#: the span (in raw feature units) below which coverage counts as too narrow.
-#: ``eye_tilt`` and ``roll`` are in units of 30 degrees, so 0.3 is 9 degrees of
-#: total spread -- a low bar that a user who tilted at all will clear.
+#: How much the head must move **at each individual dot**, as a span in raw
+#: feature units. ``eye_tilt`` and ``roll`` are in units of 30 degrees, so 0.80
+#: is 24 degrees of tilt swept while looking at one dot.
+#:
+#: Per dot, not pooled over the whole calibration, and that distinction is the
+#: whole value of the check. Pooled, a calibration that holds a different fixed
+#: posture at every dot looks excellent -- plenty of tilt overall -- while being
+#: one of the worst kinds there is, because head position then tells the model
+#: which dot was being looked at. Measured in the simulator:
+#:
+#:     scenario                 true error   per-dot span   pooled span
+#:     head roams at every dot      25 px          1.22          1.28
+#:     posture held, still drifts   23 px          0.88          2.21
+#:     head roams lazily            39 px          0.77          0.82
+#:     posture held rigidly         40 px          0.23          1.55
+#:     head barely moves            68 px          0.38          0.42
+#:
+#: The per-dot column orders with the true error; the pooled one does not, and
+#: rates the 40 px case above the 25 px one.
+#:
+#: Tilt alone cannot separate the 23 px and 39 px cases -- their per-dot spans
+#: are 0.88 and 0.77, near enough that a threshold between them would flip on
+#: noise. Distance and side-to-side separate them cleanly (2.33 against 1.35),
+#: so the tilt target is set low enough to pass both and the other two carry
+#: the decision. Any one axis failing is enough to warn.
 COVERAGE_TARGETS: Dict[str, float] = {
-    "eye_tilt": 0.30,
-    "roll": 0.30,
-    "head_x": 0.25,
-    "head_z": 0.40,
+    "eye_tilt": 0.70,
+    "roll": 0.70,
+    "head_x": 1.60,
+    "head_z": 1.60,
 }
+
+#: Head features whose correlation with the target position is worth checking.
+_CONFOUND_FEATURES = ("eye_tilt", "roll", "yaw", "pitch", "head_x", "head_y", "head_z")
+
+#: Correlation above which head pose and screen position are treated as
+#: confounded.
+#:
+#: If the head is always tilted the same way when looking at the top-left dot,
+#: the fit cannot tell "tilted" from "looking top-left", and will happily
+#: explain screen position using tilt -- which then falls apart the moment the
+#: user tilts while looking somewhere else. Measured in the simulator: a
+#: calibration where the head roams freely at every point scores 0.06, one
+#: where a posture is held rigidly per point scores 0.33 and costs nearly
+#: double the error.
+#:
+#: The threshold is set well above that 0.33 because the two cases overlap:
+#: holding a posture but still drifting naturally also scores around 0.28 and
+#: is perfectly good. This flags calibrations that are unambiguously
+#: confounded, not every one that leans that way.
+MAX_TARGET_CORRELATION = 0.45
+
+
+#: The two ways of collecting a calibration.
+#:
+#: ``postures``
+#:     One prompted posture per dot, held while the samples are taken. Quick,
+#:     and accurate when it is followed -- but it depends on the user actually
+#:     following it, and it is fragile in a specific way: if the head is always
+#:     in the same place for a given dot, head position and screen position
+#:     become interchangeable to the fit. Measured in the simulator, held
+#:     rigidly it costs 42 px against 23 px when the head keeps drifting.
+#:
+#: ``explore``
+#:     The head roams freely at every dot while the eyes stay on it. Every
+#:     screen position then sees the whole range of head positions, so the two
+#:     cannot be confused by construction -- the correlation between them falls
+#:     from 0.33 to 0.06. It takes longer and asks the user to keep moving
+#:     rather than to hit a particular pose, which is a much easier thing to
+#:     do right.
+METHODS: Tuple[str, ...] = ("explore", "postures")
+DEFAULT_METHOD = "explore"
+
+#: Head tilt, in degrees either side of upright, that the explore method tries
+#: to see at every dot. Comfortable to reach without stretching.
+EXPLORE_ROLL_RANGE = 18.0
+
+#: How many bins that range is divided into for the coverage ring.
+EXPLORE_ROLL_BINS = 12
+
+#: Fraction of the bins that counts as having covered the range. Not all of
+#: them: the extremes need a deliberate stretch, and the point of the ring is
+#: to keep the user moving, not to hold them at a dot until they hit every bin.
+EXPLORE_COVERAGE_TARGET = 0.75
+
+
+class PoseCoverage:
+    """Which head tilts have been seen while looking at the current dot.
+
+    The explore method asks the user to keep moving, which is a vague
+    instruction with no way of telling whether you have done enough of it.
+    Binning the tilts actually observed turns it into a concrete goal, and one
+    that can be drawn as a ring round the dot -- so it is answered without ever
+    looking away from the dot to read anything.
+    """
+
+    def __init__(self, bins: int = EXPLORE_ROLL_BINS,
+                 roll_range: float = EXPLORE_ROLL_RANGE) -> None:
+        self.bins = max(int(bins), 2)
+        self.roll_range = float(roll_range)
+        self.seen = [False] * self.bins
+
+    def bin_for(self, roll_deg: float) -> Optional[int]:
+        """Which bin a tilt falls in, or ``None`` if it is outside the range."""
+        if not np.isfinite(roll_deg) or abs(roll_deg) > self.roll_range:
+            return None
+        position = (roll_deg + self.roll_range) / (2 * self.roll_range)
+        return min(int(position * self.bins), self.bins - 1)
+
+    def observe(self, roll_deg: float) -> None:
+        index = self.bin_for(roll_deg)
+        if index is not None:
+            self.seen[index] = True
+
+    @property
+    def fraction(self) -> float:
+        return sum(self.seen) / self.bins
+
+    @property
+    def complete(self) -> bool:
+        return self.fraction >= EXPLORE_COVERAGE_TARGET
+
+    def reset(self) -> None:
+        self.seen = [False] * self.bins
 
 
 def posture(point_index: int) -> Posture:
@@ -382,6 +496,33 @@ def robust_filter(samples: np.ndarray, threshold: float = MAD_THRESHOLD,
     return survivors & ~fine
 
 
+@dataclass
+class CalibrationDiagnosis:
+    """Why a calibration came out the way it did.
+
+    Exists because "POOR" on its own is not actionable. Every field here is
+    something the user can do something about: collect more samples, move their
+    head more, move it less predictably, or fix the lighting in one corner of
+    the screen.
+    """
+
+    points_kept: int
+    points_attempted: int
+    samples_kept: int
+    samples_rejected: int
+    #: Observed span of each coverage-relevant feature, as a fraction of the
+    #: span wanted. Below 1.0 means the model never saw enough of that axis.
+    coverage: Dict[str, float] = field(default_factory=dict)
+    #: Strongest correlation between a head feature and target position.
+    target_correlation: float = 0.0
+    target_correlation_detail: str = ""
+    warnings: List[str] = field(default_factory=list)
+
+    @property
+    def samples_per_point(self) -> float:
+        return self.samples_kept / self.points_kept if self.points_kept else 0.0
+
+
 class CalibrationSession:
     """Accumulates per-target samples and fits a :class:`RidgeGazeEstimator`."""
 
@@ -476,42 +617,126 @@ class CalibrationSession:
                 np.array(group_rows, dtype=np.int32))
 
     def coverage(self) -> Dict[str, float]:
-        """Observed span of each coverage-relevant feature, as a fraction of
-        the span :data:`COVERAGE_TARGETS` asks for.
+        """How much the head moved at each dot, against what is wanted.
 
-        A value below 1.0 means calibration never saw enough of that axis for
-        the model to compensate along it. Reported rather than enforced: a
-        narrow calibration is still usable, it is just fragile in a way the
-        user deserves to be told about.
+        For each feature, the *median across dots* of that dot's own span,
+        divided by the target in :data:`COVERAGE_TARGETS`. Below 1.0 means the
+        head was too still while each dot was on screen, and the model has no
+        way to tell head movement from eye movement.
+
+        The median rather than the mean, so one dot where the user fidgeted
+        cannot cover for twelve where they did not.
+
+        Reported rather than enforced: a narrow calibration is still usable, it
+        is just fragile in a way the user deserves to be told about.
         """
         if not self.samples:
-            return {name: 0.0 for name in COVERAGE_TARGETS}
-        matrix = np.array([s.features for s in self.samples], dtype=np.float64)
-        spans = matrix.max(axis=0) - matrix.min(axis=0)
+            return {name: 0.0 for name in COVERAGE_TARGETS
+                    if name in self.feature_names}
+
+        by_point: Dict[int, List[np.ndarray]] = {}
+        for sample in self.samples:
+            by_point.setdefault(sample.point_id, []).append(sample.features)
+
         result: Dict[str, float] = {}
         for name, wanted in COVERAGE_TARGETS.items():
-            if name not in self.feature_names:
+            if name not in self.feature_names or wanted <= 0:
                 continue
-            observed = float(spans[self.feature_names.index(name)])
-            result[name] = observed / wanted if wanted > 0 else 1.0
+            index = self.feature_names.index(name)
+            spans = [float(np.ptp([row[index] for row in rows]))
+                     for rows in by_point.values() if len(rows) > 1]
+            result[name] = float(np.median(spans)) / wanted if spans else 0.0
         return result
 
-    def coverage_warnings(self) -> List[str]:
-        """Human-readable notes about axes calibration barely varied along."""
+    def target_correlation(self) -> Tuple[float, str]:
+        """Strongest correlation between a head feature and target position.
+
+        A calibration where the head is in a characteristic place for each dot
+        teaches the model to read the dot off the head, which works beautifully
+        on the calibration data and collapses in use.
+        """
+        if len(self.samples) < 8:
+            return 0.0, ""
+        matrix = np.array([s.features for s in self.samples], dtype=np.float64)
+        targets = np.array([s.target for s in self.samples], dtype=np.float64)
+        worst, detail = 0.0, ""
+        for name in _CONFOUND_FEATURES:
+            if name not in self.feature_names:
+                continue
+            column = matrix[:, self.feature_names.index(name)]
+            if column.std() < 1e-9:
+                continue
+            for axis, label in ((0, "horizontally"), (1, "vertically")):
+                if targets[:, axis].std() < 1e-9:
+                    continue
+                value = abs(float(np.corrcoef(column, targets[:, axis])[0, 1]))
+                if value > worst:
+                    worst, detail = value, f"{name} tracked where the dot was {label}"
+        return worst, detail
+
+    def diagnose(self) -> CalibrationDiagnosis:
+        """Everything known about why this calibration is as good as it is."""
+        attempted = len({s.point_id for s in self.samples})
+        try:
+            features, _targets, groups = self.build_matrices()
+            kept_points = int(len(np.unique(groups)))
+            kept_samples = int(features.shape[0])
+        except ValueError:
+            kept_points, kept_samples = 0, 0
+
+        correlation, detail = self.target_correlation()
+        diagnosis = CalibrationDiagnosis(
+            points_kept=kept_points,
+            points_attempted=attempted,
+            samples_kept=kept_samples,
+            samples_rejected=self.rejected + max(0, len(self.samples) - kept_samples),
+            coverage=self.coverage(),
+            target_correlation=correlation,
+            target_correlation_detail=detail,
+        )
+
         labels = {"eye_tilt": "head tilt", "roll": "head tilt",
                   "head_x": "side-to-side movement",
-                  "head_z": "distance from the screen"}
-        seen, warnings = set(), []
-        for name, ratio in sorted(self.coverage().items()):
+                  "head_z": "movement towards and away from the screen"}
+        seen = set()
+        for name, ratio in sorted(diagnosis.coverage.items()):
             label = labels.get(name, name)
             if ratio >= 1.0 or label in seen:
                 continue
             seen.add(label)
-            warnings.append(
-                f"Very little {label} during calibration; tracking may drift "
-                f"when you {'tilt your head' if label == 'head tilt' else 'move'}."
+            # Graded, because 96% of the wanted range and 28% of it are not
+            # the same problem and should not read as the same sentence.
+            severity = ("barely moved" if ratio < 0.6 else
+                        "did not move much" if ratio < 0.85 else
+                        "moved a little less than is ideal")
+            diagnosis.warnings.append(
+                f"Your head {severity} while each dot was on screen: {label} "
+                f"covered {ratio * 100:.0f}% of the range wanted. The tracker "
+                f"cannot tell head movement from eye movement unless it sees "
+                f"both at the same dot, so it will drift when you move."
             )
-        return warnings
+        if kept_points < attempted:
+            diagnosis.warnings.append(
+                f"{attempted - kept_points} of {attempted} points had too few usable "
+                f"samples and were dropped. Check your lighting, and that your face "
+                f"stays in frame when you look at the edges of the screen."
+            )
+        if kept_points and diagnosis.samples_per_point < MIN_SAMPLES_PER_POINT * 2:
+            diagnosis.warnings.append(
+                f"Only {diagnosis.samples_per_point:.0f} samples survived per point. "
+                f"More time on each dot, or better lighting, would help."
+            )
+        if correlation > MAX_TARGET_CORRELATION:
+            diagnosis.warnings.append(
+                f"Your head position gave away which dot you were looking at "
+                f"({detail}). Move your head more freely at every dot, so that "
+                f"head position and screen position are not tied together."
+            )
+        return diagnosis
+
+    def coverage_warnings(self) -> List[str]:
+        """Human-readable notes about what went wrong, worst first."""
+        return self.diagnose().warnings
 
     def fit(self) -> RidgeGazeEstimator:
         features, targets, groups = self.build_matrices()
@@ -521,8 +746,9 @@ class CalibrationSession:
         if distinct < MIN_POINTS_FOR_FIT:
             raise ValueError(
                 f"Only {distinct} calibration points produced usable data; "
-                f"at least {MIN_POINTS_FOR_FIT} are required. Try again with "
-                f"better lighting and less head movement."
+                f"at least {MIN_POINTS_FOR_FIT} are required. Better lighting, "
+                f"and keeping your face in frame when you look at the edges of "
+                f"the screen, are what usually fix this."
             )
         return RidgeGazeEstimator.fit(
             features, targets, groups,
@@ -552,5 +778,5 @@ class CalibrationSession:
             report=estimator.report,
             camera_index=camera_index,
             pattern=pattern,
-            coverage_warnings=self.coverage_warnings(),
+            coverage_warnings=self.diagnose().warnings,
         )

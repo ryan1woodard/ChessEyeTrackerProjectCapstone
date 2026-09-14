@@ -152,6 +152,12 @@ class TestCalibrationWindow:
         tilts = [p.roll_deg for p in postures if p.is_tilt]
         assert min(tilts) < 0 < max(tilts)
 
+    @staticmethod
+    def _postures_config(tmp_path):
+        config = Config.load(user_path=tmp_path / "c.json")
+        config.set("calibration.method", "postures")
+        return config
+
     def test_the_pose_phase_comes_before_the_dot(self, qapp, tmp_path):
         """The instruction has to be readable before anything is recorded.
 
@@ -161,8 +167,8 @@ class TestCalibrationWindow:
         from PySide6.QtGui import QPixmap
         from src.gui.calibration_window import CalibrationWindow, PHASE_POSE
 
-        config = Config.load(user_path=tmp_path / "c.json")
-        window = CalibrationWindow(config, Rect(0, 0, 1000, 800), 1, 0)
+        window = CalibrationWindow(self._postures_config(tmp_path),
+                                   Rect(0, 0, 1000, 800), 1, 0)
         window.resize(1000, 800)
         window._begin_point(1)
         assert window._phase == PHASE_POSE
@@ -174,8 +180,8 @@ class TestCalibrationWindow:
         from src.gui.calibration_window import (CalibrationWindow, PHASE_POSE,
                                                 PHASE_SETTLE)
 
-        config = Config.load(user_path=tmp_path / "c.json")
-        window = CalibrationWindow(config, Rect(0, 0, 1000, 800), 1, 0)
+        window = CalibrationWindow(self._postures_config(tmp_path),
+                                   Rect(0, 0, 1000, 800), 1, 0)
         window._begin_point(1)                      # a tilt posture
         window._face_present = True
         window._head_roll = 0.0                     # not tilted yet
@@ -193,8 +199,8 @@ class TestCalibrationWindow:
         """A tilt some webcams cannot see must not block the whole calibration."""
         from src.gui.calibration_window import CalibrationWindow, PHASE_SETTLE
 
-        config = Config.load(user_path=tmp_path / "c.json")
-        window = CalibrationWindow(config, Rect(0, 0, 1000, 800), 1, 0)
+        window = CalibrationWindow(self._postures_config(tmp_path),
+                                   Rect(0, 0, 1000, 800), 1, 0)
         window._begin_point(1)
         window._face_present = True
         window._head_roll = 0.0
@@ -276,14 +282,131 @@ class TestCalibrationWindow:
             feed(3, 8.8)                                 # leaning in
         assert window.resting_position[1] == pytest.approx(10.0, abs=0.01)
 
+    def test_explore_is_the_default_and_skips_the_pose_phase(self, qapp, tmp_path):
+        """Explore asks the same thing at every dot, so there is nothing to read.
+
+        A phase spent reading an unchanging instruction is a phase spent not
+        moving, which is the one thing this method needs.
+        """
+        from src.gui.calibration_window import (CalibrationWindow, PHASE_COLLECT,
+                                                PHASE_SETTLE)
+
+        config = Config.load(user_path=tmp_path / "c.json")
+        window = CalibrationWindow(config, Rect(0, 0, 1000, 800), 1, 0)
+        assert window.exploring, "explore should be the default method"
+        window._begin_point(1)
+        assert window._phase == PHASE_SETTLE
+        for _ in range(int(window._settle_ms / 25) + 2):
+            window._tick()
+        assert window._phase == PHASE_COLLECT
+
+    def test_explore_keeps_a_dot_until_the_head_has_been_round_it(self, qapp, tmp_path):
+        """Coverage, not a sample count, is what finishes a dot.
+
+        Sitting still would otherwise satisfy a sample quota in a second while
+        recording one head position, which is exactly the calibration this
+        method exists to avoid.
+        """
+        from src.gui.calibration_window import CalibrationWindow, PHASE_COLLECT
+
+        config = Config.load(user_path=tmp_path / "c.json")
+        window = CalibrationWindow(config, Rect(0, 0, 1000, 800), 1, 0)
+        window._phase = PHASE_COLLECT
+        window._phase_elapsed = window._explore_min_ms + 100
+        window._head_roll = 0.0
+        assert not window._collect_finished(), "a still head finished the dot"
+
+        for roll in range(-18, 19, 2):
+            window._coverage.observe(roll)
+        assert window._collect_finished()
+
+    def test_explore_never_waits_forever(self, qapp, tmp_path):
+        from src.gui.calibration_window import CalibrationWindow, PHASE_COLLECT
+
+        config = Config.load(user_path=tmp_path / "c.json")
+        window = CalibrationWindow(config, Rect(0, 0, 1000, 800), 1, 0)
+        window._phase = PHASE_COLLECT
+        window._phase_elapsed = window._explore_ms + 1
+        assert window._collect_finished()
+
+    def test_explore_records_every_frame_rather_than_a_quota(self, qapp, tmp_path):
+        """The quota exists to stop one pose dominating; here more is better."""
+        from src.gui.calibration_window import CalibrationWindow, PHASE_COLLECT
+        from src.tracking.features import FeatureVector
+        from src.tracking.head_pose import HeadPose
+        from src.tracking.pipeline import GazeSample
+
+        config = Config.load(user_path=tmp_path / "c.json")
+        window = CalibrationWindow(config, Rect(0, 0, 1000, 800), 1, 0)
+        window._phase = PHASE_COLLECT
+        names = list(config.get("calibration.model_features"))
+        for index in range(window._quota * 2):
+            values = {name: 0.01 * index for name in names}
+            values["ear_l"] = values["ear_r"] = 0.3
+            window.on_sample(GazeSample(
+                timestamp=0.0, face_detected=True,
+                head_pose=HeadPose(pitch=0.0, yaw=0.0, roll=(index % 30) - 15),
+                features=FeatureVector(values=values, valid=True)))
+        assert window._collected > window._quota
+
+    def test_the_coverage_ring_tracks_the_tilts_seen(self, qapp, tmp_path):
+        from src.gui.calibration_window import CalibrationWindow, PHASE_COLLECT
+        from src.tracking.features import FeatureVector
+        from src.tracking.head_pose import HeadPose
+        from src.tracking.pipeline import GazeSample
+
+        config = Config.load(user_path=tmp_path / "c.json")
+        window = CalibrationWindow(config, Rect(0, 0, 1000, 800), 1, 0)
+        window._phase = PHASE_COLLECT
+        assert window._coverage.fraction == 0.0
+        for roll in range(-18, 19, 2):
+            window.on_sample(GazeSample(
+                timestamp=0.0, face_detected=True,
+                head_pose=HeadPose(pitch=0.0, yaw=0.0, roll=float(roll)),
+                features=FeatureVector(values={"ear_l": 0.3, "ear_r": 0.3}, valid=True)))
+        assert window._coverage.complete
+
+    def test_the_method_can_be_switched_from_the_intro(self, qapp, tmp_path):
+        from PySide6.QtCore import Qt
+        from PySide6.QtGui import QKeyEvent
+        from PySide6.QtCore import QEvent
+        from src.gui.calibration_window import CalibrationWindow, PHASE_INTRO
+
+        config = Config.load(user_path=tmp_path / "c.json")
+        window = CalibrationWindow(config, Rect(0, 0, 1000, 800), 1, 0)
+        window._phase = PHASE_INTRO
+        before = window._method
+        window.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_M, Qt.NoModifier))
+        assert window._method != before
+        window.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_M, Qt.NoModifier))
+        assert window._method == before
+
+    def test_both_methods_paint_every_phase(self, qapp, tmp_path):
+        from PySide6.QtGui import QPixmap
+        from src.gui.calibration_window import (CalibrationWindow, PHASE_COLLECT,
+                                                PHASE_INTRO, PHASE_POSE, PHASE_SETTLE)
+
+        for method in ("explore", "postures"):
+            config = Config.load(user_path=tmp_path / f"{method}.json")
+            config.set("calibration.method", method)
+            window = CalibrationWindow(config, Rect(0, 0, 900, 700), 1, 0)
+            window.resize(900, 700)
+            window._face_present = True
+            window._head_roll = 8.0
+            window._coverage.observe(4.0)
+            for phase in (PHASE_INTRO, PHASE_POSE, PHASE_SETTLE, PHASE_COLLECT):
+                for index in (0, 1, 3, 8):
+                    window._phase, window._index = phase, index
+                    window.render(QPixmap(900, 700))
+
     def test_the_posture_reminder_stays_next_to_the_dot(self, qapp, tmp_path):
         """It is for peripheral vision, so it must not sit across the screen."""
         from PySide6.QtGui import QPixmap
         from src.gui.calibration_window import (CalibrationWindow, PHASE_COLLECT,
                                                 PHASE_SETTLE)
 
-        config = Config.load(user_path=tmp_path / "c.json")
-        window = CalibrationWindow(config, Rect(0, 0, 800, 600), 1, 0)
+        window = CalibrationWindow(self._postures_config(tmp_path),
+                                   Rect(0, 0, 800, 600), 1, 0)
         window.resize(800, 600)
         window._face_present = True
         window._head_roll = 10.0
@@ -305,6 +428,27 @@ class TestCalibrationWindow:
         names = window._session.feature_names
         assert names == list(config.get("calibration.model_features"))
         assert set(names) <= set(FEATURE_NAMES), "config names an unknown feature"
+
+
+class TestSettingsCalibrationMethod:
+    def test_the_method_can_be_chosen_and_saved(self, qapp, tmp_path):
+        """It is a hotkey on the calibration screen too, but that is not
+        somewhere anyone looks for a setting."""
+        from src.gui.settings_window import SettingsWindow
+        from src.tracking.camera import CameraInfo
+        from src.utils.screens import ScreenInfo
+
+        config = Config.load(user_path=tmp_path / "s.json")
+        dialog = SettingsWindow(config, [CameraInfo(0, "Cam", 1280, 720)],
+                                [ScreenInfo(1, "Main", Rect(0, 0, 1920, 1080), 1.0)])
+        combo = dialog.calibration_method_combo
+        assert {combo.itemData(i) for i in range(combo.count())} == {"explore", "postures"}
+        assert combo.currentData() == config.get("calibration.method")
+
+        combo.setCurrentIndex(1 - combo.currentIndex())
+        chosen = combo.currentData()
+        dialog._accept()
+        assert config.get("calibration.method") == chosen
 
 
 class TestBoardSelector:
