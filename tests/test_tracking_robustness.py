@@ -80,7 +80,19 @@ def _mean_error(estimator, simulator: EyeSimulator, head: HeadState,
 
 @pytest.fixture(scope="module")
 def simulator() -> EyeSimulator:
-    return EyeSimulator(noise_px=0.35, rng=np.random.default_rng(11))
+    """A subject whose face is not the canonical one, as everybody's is not."""
+    return EyeSimulator(noise_px=0.35, shape_mm=3.0, rng=np.random.default_rng(11))
+
+
+@pytest.fixture(scope="module")
+def average_face() -> EyeSimulator:
+    """A subject who happens to match the canonical head exactly.
+
+    Only for asserting absolute angles. Anything about accuracy should use
+    ``simulator``, because a tracker that only works on the average face is not
+    a working tracker.
+    """
+    return EyeSimulator(noise_px=0.35, shape_mm=0.0, rng=np.random.default_rng(11))
 
 
 @pytest.fixture(scope="module")
@@ -147,20 +159,24 @@ class TestHeadTilt:
 
     TILTS = [-25, -15, -8, 0, 8, 15, 25]
 
-    def test_eye_local_features_cannot_see_tilt_at_all(self, simulator):
+    def test_the_image_aligned_pair_is_the_one_that_survives_tilt(self, simulator):
         """Why the old feature set could not be fixed by more calibration.
 
-        The eye-local offset is measured on an axis that rotates with the head,
-        so it is the same number whether the head is upright or tilted 20
-        degrees. No regression can recover from an input that does not vary.
+        Holding a gaze on one screen point and tilting the head does not change
+        where the eye points in the world, so the image-aligned offset barely
+        moves. The eye-local offset is that same direction re-expressed in a
+        frame that has rotated underneath it, so it swings -- and a model given
+        only the eye-local pair is being asked to predict an unchanged screen
+        position from an input that changed.
         """
         upright = simulator.features((960, 540), HeadState())
         tilted = simulator.features((960, 540), HeadState(roll_deg=20))
-        assert tilted.values["iris_mean_x"] == pytest.approx(
-            upright.values["iris_mean_x"], abs=0.01)
-        # The image-aligned pair does move, which is what makes it usable.
-        assert abs(tilted.values["iris_mean_ix"]
-                   - upright.values["iris_mean_ix"]) > 0.01
+        image_change = abs(tilted.values["iris_mean_ix"]
+                           - upright.values["iris_mean_ix"])
+        local_change = abs(tilted.values["iris_mean_x"]
+                           - upright.values["iris_mean_x"])
+        assert local_change > 2 * image_change, (
+            f"image-aligned moved {image_change:.4f}, eye-local {local_change:.4f}")
 
     def test_eye_tilt_measures_roll_accurately(self, simulator):
         for roll in self.TILTS:
@@ -258,23 +274,25 @@ class TestHeadPose:
     @pytest.mark.parametrize("yaw,pitch,roll", [
         (0, 0, 0), (15, 0, 0), (0, 10, 0), (0, 0, 15), (10, 8, -12), (-12, -6, 20),
     ])
-    def test_the_two_backends_agree(self, simulator, yaw, pitch, roll):
+    def test_the_two_fallback_backends_agree(self, average_face, yaw, pitch, roll):
         """A profile fitted on one backend has to stay valid on the other.
 
-        The Tasks matrix decomposes to all three angles negated. Negating only
-        two of them, as this once did, left roll reading backwards on that
-        backend -- so head tilt was compensated in the wrong direction
-        depending on which MediaPipe happened to be installed.
+        Both are fallbacks now -- the rigid frame is preferred -- but they are
+        what runs when it is unusable, and they used to disagree. The Tasks
+        matrix decomposes to all three angles negated; negating only two of
+        them left roll reading backwards on that backend, so head tilt was
+        compensated in the wrong direction depending on which MediaPipe
+        happened to be installed.
         """
         head = HeadState(yaw_deg=yaw, pitch_deg=pitch, roll_deg=roll)
-        marks = simulator.landmarks((960, 540), head)
-        from_pnp = HeadPoseEstimator().estimate(marks)
+        marks = average_face.landmarks((960, 540), head)
+        from_pnp = HeadPoseEstimator(use_face_frame=False).estimate(marks)
 
         # MediaPipe Tasks reports a y-up, z-towards-viewer face-to-camera matrix.
         flip = np.diag([1.0, -1.0, -1.0])
         matrix = np.eye(4)
         matrix[:3, :3] = flip @ rotation_matrix(yaw, pitch, roll) @ flip
-        from_tasks = HeadPoseEstimator().estimate(
+        from_tasks = HeadPoseEstimator(use_face_frame=False).estimate(
             FaceLandmarks(marks.points, marks.frame_width, marks.frame_height,
                           True, matrix))
 
@@ -283,14 +301,79 @@ class TestHeadPose:
         assert from_tasks.roll == pytest.approx(from_pnp.roll, abs=0.5)
 
     @pytest.mark.parametrize("roll", [-25, -10, 0, 10, 25])
-    def test_roll_comes_from_the_landmarks_and_is_accurate(self, simulator, roll):
-        marks = simulator.landmarks((960, 540), HeadState(roll_deg=roll))
+    def test_roll_is_accurate(self, average_face, roll):
+        marks = average_face.landmarks((960, 540), HeadState(roll_deg=roll))
         assert HeadPoseEstimator().estimate(marks).roll == pytest.approx(roll, abs=2.0)
 
-    def test_a_large_tilt_counts_as_an_extreme_pose(self):
-        from src.tracking.head_pose import HeadPose
-        assert HeadPose(pitch=0, yaw=0, roll=45).is_extreme()
-        assert not HeadPose(pitch=0, yaw=0, roll=10).is_extreme()
+    @pytest.mark.parametrize("roll", [-25, -10, 0, 10, 25])
+    def test_roll_stays_accurate_on_an_unusual_face(self, simulator, roll):
+        """The canonical head is an average; nobody's face is the average."""
+        marks = simulator.landmarks((960, 540), HeadState(roll_deg=roll))
+        assert HeadPoseEstimator().estimate(marks).roll == pytest.approx(roll, abs=5.0)
+
+    def test_the_frame_is_far_steadier_than_solvepnp(self, simulator):
+        """Six landmarks cannot average anything; eighteen can.
+
+        ``solvePnP`` on six points is not merely noisier, it is unusable on the
+        pitch axis -- several degrees of wobble frame to frame while the head
+        is perfectly still.
+        """
+        def spread(use_frame):
+            angles = []
+            estimator = HeadPoseEstimator(use_face_frame=use_frame)
+            for _ in range(60):
+                pose = estimator.estimate(
+                    simulator.landmarks((960, 540), HeadState()))
+                angles.append([pose.yaw, pose.pitch, pose.roll])
+            return np.std(angles, axis=0)
+
+        frame, pnp = spread(True), spread(False)
+        assert np.all(frame < pnp), f"frame {frame.round(2)} vs solvePnP {pnp.round(2)}"
+        assert frame.max() < 0.5, f"frame wobble {frame.round(2)} deg"
+
+    def test_solvepnp_is_the_one_that_unusual_faces_break(self):
+        """Why the rigid frame is preferred rather than merely available.
+
+        Fitting six landmarks to a canonical six leaves nothing over to absorb
+        the difference between that canonical face and the person in front of
+        the camera, so the mismatch goes straight into the angles. Eighteen
+        landmarks and eight parameters leave room for it.
+        """
+        poses = [(0, 0, 0), (18, 0, 0), (-18, 0, 0), (0, 12, 0), (0, -12, 0)]
+
+        def tracking_error(use_frame: bool, shape_mm: float) -> float:
+            subjects = []
+            for seed in range(4):
+                sim = EyeSimulator(noise_px=0.35, shape_mm=shape_mm,
+                                   rng=np.random.default_rng(seed))
+                estimator = HeadPoseEstimator(use_face_frame=use_frame)
+                estimated, true = [], []
+                for yaw, pitch, roll in poses:
+                    pose = estimator.estimate(sim.landmarks((960, 540), HeadState(
+                        yaw_deg=yaw, pitch_deg=pitch, roll_deg=roll)))
+                    estimated.append([pose.yaw, pose.pitch])
+                    true.append([yaw, pitch])
+                estimated, true = np.array(estimated), np.array(true)
+                # Each subject's constant bias is absorbed by calibration; what
+                # matters is whether the estimate MOVES with the head.
+                subjects.append(np.abs((estimated - estimated.mean(0))
+                                       - (true - true.mean(0))).mean())
+            return float(np.mean(subjects))
+
+        average = tracking_error(use_frame=False, shape_mm=0.0)
+        unusual = tracking_error(use_frame=False, shape_mm=6.0)
+        assert unusual > 2 * average, (
+            f"solvePnP: {average:.2f} deg on an average face, {unusual:.2f} on an "
+            f"unusual one")
+
+        # The rigid frame tracks a little less faithfully in absolute terms --
+        # weak perspective compresses out-of-plane angles -- but it does so by
+        # the same amount whoever is sitting there, which is what a calibrated
+        # feature needs.
+        frame_average = tracking_error(use_frame=True, shape_mm=0.0)
+        frame_unusual = tracking_error(use_frame=True, shape_mm=6.0)
+        assert frame_unusual < 1.3 * frame_average, (
+            f"frame: {frame_average:.2f} deg vs {frame_unusual:.2f} deg")
 
 
 def _pipeline(estimator, preset: str = "medium") -> TrackingPipeline:

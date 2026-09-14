@@ -29,6 +29,7 @@ from typing import Optional
 import cv2
 import numpy as np
 
+from .face_frame import FaceFrame, fit_face_frame
 from .face_tracker import (CHIN, EYE_LEFT_INNER, EYE_LEFT_OUTER,
                            EYE_RIGHT_INNER, EYE_RIGHT_OUTER, FaceLandmarks,
                            MOUTH_LEFT, MOUTH_RIGHT, NOSE_TIP)
@@ -103,7 +104,10 @@ def _matrix_to_euler(rotation: np.ndarray) -> tuple[float, float, float]:
 class HeadPoseEstimator:
     """Estimates head orientation from six stable facial landmarks."""
 
-    def __init__(self) -> None:
+    def __init__(self, use_face_frame: bool = True) -> None:
+        #: Prefer the rigid face frame over ``solvePnP``. See
+        #: :meth:`_orientation` for why that is the default.
+        self.use_face_frame = bool(use_face_frame)
         self._last_rvec: Optional[np.ndarray] = None
         self._last_tvec: Optional[np.ndarray] = None
 
@@ -138,7 +142,20 @@ class HeadPoseEstimator:
         mean_cos = sum(math.cos(a) for a in angles) / len(angles)
         return math.degrees(math.atan2(mean_sin, mean_cos))
 
-    def estimate(self, landmarks: FaceLandmarks) -> HeadPose:
+    def estimate(self, landmarks: FaceLandmarks,
+                 frame: Optional[FaceFrame] = None) -> HeadPose:
+        """Head orientation for one frame.
+
+        ``frame`` is the already-fitted rigid face frame. The pipeline fits it
+        once and hands it to both this and the feature extractor; pass nothing
+        and one is fitted here.
+        """
+        if self.use_face_frame:
+            frame = frame if frame is not None else fit_face_frame(landmarks)
+            if frame.valid:
+                pitch, yaw, roll = frame.euler_degrees()
+                return HeadPose(pitch=pitch, yaw=yaw, roll=roll, valid=True)
+
         pose = self._orientation(landmarks)
         roll = self.roll_from_landmarks(landmarks)
         if roll is None or not pose.valid:

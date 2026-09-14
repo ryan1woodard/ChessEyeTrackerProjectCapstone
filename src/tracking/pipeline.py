@@ -19,6 +19,7 @@ import numpy as np
 from ..utils.geometry import clamp
 from .blink import BlinkDetector
 from .calibration import CalibrationProfile
+from .face_frame import fit_face_frame
 from .face_tracker import FaceTracker
 from .features import FeatureExtractor, FeatureVector
 from .gaze_estimator import GazeEstimator, GazeResult
@@ -77,6 +78,7 @@ class ConfidenceScorer:
         self.blink_threshold = blink_threshold
         self.open_baseline: Optional[float] = None
         self._recent: Deque[Tuple[float, float]] = deque(maxlen=history)
+        self._disagreement: Deque[float] = deque(maxlen=150)
         self.calibration_factor = 1.0
 
     def set_calibration_quality(self, mean_error_px: float, diagonal_px: float) -> None:
@@ -90,6 +92,7 @@ class ConfidenceScorer:
 
     def reset(self) -> None:
         self._recent.clear()
+        self._disagreement.clear()
 
     def score(self, features: FeatureVector, gaze: GazeResult,
               screen_diagonal: float) -> float:
@@ -127,10 +130,21 @@ class ConfidenceScorer:
         span = max(wide_open - threshold, 1e-6)
         factors.append(clamp((openness - threshold) / span, 0.0, 1.0))
 
-        # Both eyes should report similar horizontal iris offsets. A large
-        # disagreement usually means one iris landmark set is unreliable.
+        # The two eyes should report the same horizontal iris offset, and a
+        # sudden divergence means one iris landmark set has gone bad.
+        #
+        # What is scored is the divergence from this user's own usual figure,
+        # not its absolute size. The offsets are measured from a canonical
+        # head, so a face that differs from the average sits at a standing
+        # disagreement -- from 0.02 to 0.18 across simulated faces, against a
+        # frame-to-frame variation of 0.005. Scored absolutely, that constant
+        # is read as permanent unreliability and the user's confidence never
+        # recovers, which is the same mistake a fixed blink threshold makes.
         disagreement = abs(features.get("iris_l_ix") - features.get("iris_r_ix"))
-        factors.append(clamp(1.0 - disagreement / 0.35, 0.15, 1.0))
+        self._disagreement.append(disagreement)
+        if len(self._disagreement) >= 12:
+            excess = max(0.0, disagreement - float(np.median(self._disagreement)))
+            factors.append(clamp(1.0 - excess / 0.10, 0.15, 1.0))
 
         self._recent.append((gaze.x, gaze.y))
         if len(self._recent) >= 4 and screen_diagonal > 0:
@@ -259,8 +273,12 @@ class TrackingPipeline:
             self.confidence.reset()
             return GazeSample(timestamp=now, fps=fps, calibrated=self.is_calibrated)
 
-        pose = self.head_pose_estimator.estimate(landmarks)
-        features = self.feature_extractor.extract(landmarks, pose)
+        # Fitted once and shared: the pose estimator and the feature extractor
+        # both want it, and two fits of the same landmarks would disagree by
+        # nothing while costing twice as much.
+        frame = fit_face_frame(landmarks)
+        pose = self.head_pose_estimator.estimate(landmarks, frame)
+        features = self.feature_extractor.extract(landmarks, pose, frame)
         return self.process_features(features, now, fps=fps, landmarks=landmarks)
 
     def process_features(self, features: FeatureVector, now: float,

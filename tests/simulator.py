@@ -38,6 +38,7 @@ import numpy as np
 
 from src.tracking import face_tracker as fl
 from src.tracking.face_tracker import FaceLandmarks
+from src.tracking.face_frame import fit_face_frame
 from src.tracking.features import FeatureExtractor, FeatureVector
 from src.tracking.head_pose import HeadPoseEstimator
 
@@ -60,16 +61,43 @@ EYEBALL_DEPTH_MM = 11.5
 NECK_PIVOT_MM = np.array([0.0, 115.0, 45.0], dtype=np.float64)
 
 #: Canonical head geometry, head-local millimetres from the eye midpoint.
+#:
+#: Anthropometrically plausible rather than exact -- what the experiments here
+#: need is landmarks in roughly the right places, spread over the face, so that
+#: a fit which averages many of them behaves the way it will on a real face.
 _FACE_MM: Dict[int, Tuple[float, float, float]] = {
-    fl.EYE_LEFT_OUTER: (-45.0, 0.0, 8.0),
-    fl.EYE_LEFT_INNER: (-15.0, 0.0, -4.0),
-    fl.EYE_RIGHT_OUTER: (45.0, 0.0, 8.0),
-    fl.EYE_RIGHT_INNER: (15.0, 0.0, -4.0),
     fl.NOSE_TIP: (0.0, 32.7, -26.0),
     fl.CHIN: (0.0, 96.3, -13.5),
     fl.MOUTH_LEFT: (-28.9, 61.6, -1.9),
     fl.MOUTH_RIGHT: (28.9, 61.6, -1.9),
     fl.FOREHEAD: (0.0, -55.0, 6.0),
+    # nose bridge, between the eyes down to the tip
+    168: (0.0, -2.0, -6.0),
+    6: (0.0, 8.0, -14.0),
+    197: (0.0, 2.0, -10.0),
+    195: (0.0, 16.0, -20.0),
+    4: (0.0, 28.0, -25.0),
+    # sides of the nose
+    98: (-17.0, 38.0, -12.0),
+    327: (17.0, 38.0, -12.0),
+    # temples and the upper face oval
+    127: (-72.0, -8.0, 38.0),
+    356: (72.0, -8.0, 38.0),
+    234: (-73.0, 18.0, 34.0),
+    454: (73.0, 18.0, 34.0),
+    93: (-70.0, 38.0, 30.0),
+    323: (70.0, 38.0, 30.0),
+    # mid forehead
+    151: (0.0, -40.0, -2.0),
+}
+
+#: Eye corners in head-local millimetres. The outer corner wraps further round
+#: the side of the head, so it sits further back than the inner one.
+_EYE_CORNERS_MM = {
+    "left": {"outer": np.array([-45.0, 0.0, 8.0]),
+             "inner": np.array([-15.0, 0.0, -4.0])},
+    "right": {"outer": np.array([45.0, 0.0, 8.0]),
+              "inner": np.array([15.0, 0.0, -4.0])},
 }
 
 #: Eyeball centres, derived from the corner midpoints.
@@ -78,28 +106,59 @@ _EYE_CENTRE_MM = {
     "right": np.array([30.0, 0.0, EYEBALL_DEPTH_MM]),
 }
 
-#: Lid landmarks: (index, x-offset from the eye centre, fraction of the half
-#: aperture). The two pairs the extractor averages sit at different widths, so
-#: the inner pair opens slightly less than the outer pair, as in a real eye.
-_LIDS = {
-    "left": [
-        (fl.EYE_LEFT_TOP, fl.EYE_LEFT_BOTTOM, -1.0, 1.00),
-        (fl.EYE_LEFT_TOP2, fl.EYE_LEFT_BOTTOM2, 3.5, 0.88),
-    ],
-    "right": [
-        (fl.EYE_RIGHT_TOP, fl.EYE_RIGHT_BOTTOM, 1.0, 1.00),
-        (fl.EYE_RIGHT_TOP2, fl.EYE_RIGHT_BOTTOM2, -3.5, 0.88),
-    ],
-}
+#: Where the lid margins of a relaxed open eye sit, in millimetres from the
+#: eye axis. Their sum is the palpebral aperture, about 10 mm on an adult,
+#: against a 30 mm eye width -- which is what makes a fully open eye read as an
+#: openness of roughly 0.33.
+UPPER_APERTURE_MM = 6.4
+LOWER_APERTURE_MM = 3.6
 
-#: Half the vertical palpebral aperture of a relaxed eye, in millimetres.
-HALF_APERTURE_MM = 5.1
+#: Where the lids meet when the eye closes: a little below the eye axis, not on
+#: it. Both margins travel to this line, so a closure really closes, and the
+#: upper lid covers about four fifths of the distance because that is what it
+#: does on a real eye.
+CLOSURE_OFFSET_MM = 1.1
+
+
+def _eye_ring_offsets(ring: Sequence[int]) -> Dict[int, Tuple[float, float]]:
+    """Map each eyelid landmark to ``(t, lid)`` along the eye.
+
+    ``t`` runs 0 at the outer corner to 1 at the inner corner; ``lid`` is +1 on
+    the lower lid and -1 on the upper. MediaPipe's ring is ordered outer corner,
+    round the lower lid to the inner corner, then back along the upper lid, so
+    the two halves are walked separately. Deriving the lid landmarks from the
+    ring rather than listing them keeps the vertically-paired points -- the ones
+    the openness measure subtracts -- genuinely aligned.
+    """
+    lower, upper = ring[:9], ring[8:] + (ring[0],)
+    offsets: Dict[int, Tuple[float, float]] = {}
+    for index, landmark in enumerate(lower):
+        offsets[landmark] = (index / (len(lower) - 1), 1.0)
+    for index, landmark in enumerate(upper):
+        t = 1.0 - index / (len(upper) - 1)
+        if landmark not in offsets:          # corners belong to both halves
+            offsets[landmark] = (t, -1.0)
+    return offsets
+
+
+_EYE_RINGS = {"left": fl.EYE_LEFT_RING, "right": fl.EYE_RIGHT_RING}
+_RING_OFFSETS = {side: _eye_ring_offsets(ring) for side, ring in _EYE_RINGS.items()}
 
 _IRIS_IDS = {"left": fl.IRIS_LEFT, "right": fl.IRIS_RIGHT}
 
 #: Radius of the visible iris in millimetres, used to place the four rim
 #: landmarks MediaPipe reports around the pupil.
 IRIS_RADIUS_MM = 5.8
+
+
+def _lid_profile(t: float) -> float:
+    """Fraction of the full aperture reached at position ``t`` along the eye.
+
+    Zero at both corners, where the lids meet, and widest just outside the
+    middle. The exponent flattens the curve so the lid is close to fully open
+    across the centre of the eye rather than peaking at a single point.
+    """
+    return float(math.sin(math.pi * min(max(t, 0.0), 1.0)) ** 0.62)
 
 
 def rotation_matrix(yaw_deg: float, pitch_deg: float, roll_deg: float) -> np.ndarray:
@@ -173,9 +232,40 @@ class EyeSimulator:
     #: Standard deviation of the per-landmark detection noise, in pixels. Real
     #: MediaPipe iris landmarks wobble by a few tenths of a pixel per frame.
     noise_px: float = 0.0
+    #: Per-subject deviation from the canonical head, in millimetres. Nobody's
+    #: face matches the average one, and anything that fits a canonical model
+    #: to landmarks has to cope with that; without this the rigid frame would
+    #: be scored against a head it already knows exactly, which flatters it.
+    shape_mm: float = 3.0
+    #: Overall size of the head relative to the canonical one.
+    head_scale: float = 1.0
     rng: np.random.Generator = field(default_factory=lambda: np.random.default_rng(0))
     extractor: FeatureExtractor = field(default_factory=FeatureExtractor)
     pose_estimator: HeadPoseEstimator = field(default_factory=HeadPoseEstimator)
+
+    def __post_init__(self) -> None:
+        # One draw per simulator, not per frame: a face is a fixed shape, and
+        # a shape that jittered frame to frame would be noise rather than the
+        # systematic model mismatch this is meant to represent.
+        shape_rng = np.random.default_rng(self.rng.integers(1 << 32))
+
+        def vary(point) -> np.ndarray:
+            offset = shape_rng.normal(0.0, self.shape_mm, 3) if self.shape_mm else 0.0
+            return np.asarray(point, dtype=np.float64) * self.head_scale + offset
+
+        self.face_mm = {index: vary(point) for index, point in _FACE_MM.items()}
+        self.eye_corners_mm = {
+            side: {name: vary(point) for name, point in corners.items()}
+            for side, corners in _EYE_CORNERS_MM.items()
+        }
+        # The eyeball centre follows the corners rather than being drawn
+        # independently, because it is anatomically tied to them.
+        self.eye_centre_mm = {
+            side: 0.5 * (self.eye_corners_mm[side]["outer"]
+                         + self.eye_corners_mm[side]["inner"])
+            + np.array([0.0, 0.0, EYEBALL_DEPTH_MM])
+            for side in ("left", "right")
+        }
 
     # ------------------------------------------------------------- geometry
     @property
@@ -204,7 +294,7 @@ class EyeSimulator:
         return head.position + NECK_PIVOT_MM + head.rotation @ (local_mm - NECK_PIVOT_MM)
 
     def eye_centre_world(self, head: HeadState, side: str) -> np.ndarray:
-        return self._to_world(head, _EYE_CENTRE_MM[side])
+        return self._to_world(head, self.eye_centre_mm[side])
 
     def gaze_direction(self, target_px: Tuple[float, float], head: HeadState,
                        side: str) -> np.ndarray:
@@ -235,17 +325,28 @@ class EyeSimulator:
             points[index, 1] = pixel[1] / self.frame_height
             points[index, 2] = world_mm[2] / 1000.0
 
-        for index, local in _FACE_MM.items():
-            place(index, self._to_world(head, np.array(local, dtype=np.float64)))
+        for index, local in self.face_mm.items():
+            place(index, self._to_world(head, local))
 
-        half_aperture = HALF_APERTURE_MM * max(head.openness, 0.0)
+        openness = max(head.openness, 0.0)
         for side in ("left", "right"):
-            centre_local = _EYE_CENTRE_MM[side]
-            for top_id, bottom_id, dx, share in _LIDS[side]:
-                gap = half_aperture * share
-                base = centre_local + np.array([dx, 0.0, -EYEBALL_DEPTH_MM])
-                place(top_id, self._to_world(head, base + np.array([0.0, -gap, 0.0])))
-                place(bottom_id, self._to_world(head, base + np.array([0.0, gap, 0.0])))
+            corners = self.eye_corners_mm[side]
+            outer, inner = corners["outer"], corners["inner"]
+            # Lid margins for this openness. Both travel towards the closure
+            # line, so the upper lid moves about four times as far as the lower
+            # one and a full closure leaves no gap at all.
+            upper = CLOSURE_OFFSET_MM + openness * (-UPPER_APERTURE_MM - CLOSURE_OFFSET_MM)
+            lower = CLOSURE_OFFSET_MM + openness * (LOWER_APERTURE_MM - CLOSURE_OFFSET_MM)
+            for landmark, (along, lid) in _RING_OFFSETS[side].items():
+                # Slide between the corners, then lift off the eye axis to the
+                # lid margin, tapering to nothing at both corners.
+                base = outer + (inner - outer) * along
+                margin = lower if lid > 0 else upper
+                offset = np.array([0.0, margin * _lid_profile(along), 0.0])
+                # The lids wrap the eyeball, so the middle of the ring stands
+                # proud of the line between the corners.
+                bulge = np.array([0.0, 0.0, -3.0 * _lid_profile(along)])
+                place(landmark, self._to_world(head, base + offset + bulge))
 
             # The iris rides on the eyeball surface, aimed at the target.
             direction = self.gaze_direction(target_px, head, side)
@@ -262,8 +363,8 @@ class EyeSimulator:
 
             ids = _IRIS_IDS[side]
             place(ids[0], iris_world)
-            for slot, offset in enumerate((right, up, -right, -up), start=1):
-                place(ids[slot], iris_world + IRIS_RADIUS_MM * offset)
+            for slot, offset_vector in enumerate((right, up, -right, -up), start=1):
+                place(ids[slot], iris_world + IRIS_RADIUS_MM * offset_vector)
 
         return FaceLandmarks(points, self.frame_width, self.frame_height, has_iris=True)
 
@@ -273,8 +374,9 @@ class EyeSimulator:
                  blink_bias_mm: float = 0.0) -> FeatureVector:
         """Render a frame and run it through the real extraction chain."""
         marks = self.landmarks(target_px, head, blink_bias_mm)
-        pose = self.pose_estimator.estimate(marks)
-        return self.extractor.extract(marks, pose)
+        frame = fit_face_frame(marks)
+        pose = self.pose_estimator.estimate(marks, frame)
+        return self.extractor.extract(marks, pose, frame)
 
     def blink_features(self, target_px: Tuple[float, float],
                        head: Optional[HeadState] = None,

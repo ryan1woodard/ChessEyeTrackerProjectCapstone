@@ -15,30 +15,42 @@ Two frames, not one
 The iris offset is reported **twice**, in two different reference frames, and
 the difference between them is the whole story of head tilt.
 
-``iris_*_x`` / ``iris_*_y`` (eye-local)
-    Measured along the eye's own axis, outer corner to inner corner, and
-    perpendicular to it. That axis rotates with the head, so this pair is
-    *roll-invariant*: it is the rotation of the eye **within the head**.
-
 ``iris_*_ix`` / ``iris_*_iy`` (image-aligned)
-    The same offset resolved on the camera's own horizontal and vertical axes.
-    The camera does not tilt, so this pair is *roll-covariant*: it tracks where
-    the eye points in the world.
+    The displacement of the iris from the eyeball's centre of rotation,
+    resolved on the camera's own horizontal and vertical axes. The camera does
+    not tilt, so this is the direction the eye is pointing **in the world** --
+    which is the thing a screen position is a function of. Hold a gaze on one
+    point and tilt your head 20 degrees and it barely moves.
 
-Roll invariance sounds like the desirable property, and for a long time this
-module offered only that. It is precisely the wrong one. Screen position is a
-world-frame quantity, so the model needs the world-frame offset; an eye-local
-offset deliberately discards the tilt that relates the two. A model fed only
-eye-local features cannot tell a 20-degree head tilt from no tilt at all, and
-measurably does not: in the simulator it goes from 36 px of error upright to
-235 px tilted, while the image-aligned pair holds accuracy roughly flat.
+``iris_*_x`` / ``iris_*_y`` (eye-local)
+    The same displacement resolved along the eye's own axis, outer corner to
+    inner corner. That axis rotates with the head, so this is the rotation of
+    the eye **within the head**. Under the same 20-degree tilt it swings by
+    four times as much, because the world direction has to be re-expressed in a
+    frame that has turned underneath it.
 
-Both are kept. The eye-local pair is the more stable description of the eye
-itself and still carries the vergence and openness signals; the image-aligned
-pair supplies the orientation the eye-local pair throws away. Together with
-``eye_tilt`` -- the rotation between the two frames, read straight off the
-eye-corner line -- the regression has everything it needs to resolve a tilted
-head, and none of it depends on a pose solver getting Euler angles right.
+Roll invariance is the property that sounds desirable, and the eye-local pair
+is where the eye itself is most naturally described, so for a long time this
+module offered only that. It is the wrong choice. Screen position is a
+world-frame quantity, and an eye-local offset has discarded the head
+orientation that relates the two. Measured end to end, an eye-local model with
+no tilt feature costs 111 px of error against 27 px for the image-aligned one,
+and even given the tilt to correct with it only reaches 36 px.
+
+Both are kept, because the eye-local pair still carries vergence and openness,
+and ``eye_tilt`` -- the rotation between the two frames -- goes alongside them.
+
+Where the offset is measured from
+---------------------------------
+Not from the eye corners. The reference is the **centre of rotation of the
+eyeball**, which no landmark marks because it is inside the head, projected
+through the rigid face frame (see :mod:`~src.tracking.face_frame`). Two things
+follow. The measurement is the eye's rotation about its actual centre rather
+than a displacement from a nearby point on the skin, so it is the gaze
+direction rather than a proxy for it. And the reference is fitted from 18
+landmarks instead of 2, which is what takes the frame-to-frame noise in it from
+0.35 px down to 0.16 px -- the single largest accuracy gain available, because
+the corner pair contributed 71% of the variance in the offset.
 """
 
 from __future__ import annotations
@@ -49,6 +61,7 @@ from typing import Dict, List, Optional, Sequence
 import numpy as np
 
 from . import face_tracker as fl
+from .face_frame import FaceFrame, fit_face_frame
 from .face_tracker import FaceLandmarks
 from .head_pose import HeadPose
 
@@ -156,20 +169,56 @@ class FeatureVector:
         return cls(values={name: 0.0 for name in FEATURE_NAMES}, valid=False)
 
 
+#: How much of the eye's reference frame comes from the rigid face fit rather
+#: than from that eye's own two corner landmarks.
+#:
+#: The two make opposite mistakes. The corner pair is unbiased -- it is the real
+#: eye, not a canonical one -- but noisy, contributing 71% of the variance in
+#: the iris offset. The rigid fit averages 18 landmarks so it is far steadier,
+#: but it fits an average head to a particular face, and that mismatch leaves a
+#: small bias that shifts a little with pose.
+#:
+#: The bias turns out not to matter. It is very nearly rigid -- measured in the
+#: eye's own axes it moves by under a pixel across tilts, turns and leans -- so
+#: it behaves like a slightly different eyeball centre, which is precisely the
+#: kind of per-user constant calibration exists to absorb. Swept end to end
+#: over a range of face shapes and head sizes, error falls monotonically as
+#: weight moves to the fit and is lowest when it takes all of it.
+#:
+#: Kept as a weight rather than hard-coded because the corner path remains the
+#: fallback whenever the fit is unusable, and being able to dial the two
+#: together is what made the sweep possible.
+FRAME_BLEND = 1.0
+
+
 def _eye_features(landmarks: FaceLandmarks, outer: int, inner: int,
                   lids: Sequence[tuple[int, int]], iris_ids: Sequence[int],
-                  flip_axis: bool) -> Optional[EyeFeatures]:
+                  flip_axis: bool, side: str,
+                  frame: Optional[FaceFrame] = None,
+                  blend: float = FRAME_BLEND) -> Optional[EyeFeatures]:
     outer_px = landmarks.pixel(outer)
     inner_px = landmarks.pixel(inner)
     axis = (inner_px - outer_px) if not flip_axis else (outer_px - inner_px)
     width = float(np.linalg.norm(axis))
     if width < _MIN_EYE_WIDTH_PX:
         return None
-
     unit_along = axis / width
+    center = 0.5 * (outer_px + inner_px)
+
+    if frame is not None and frame.valid and blend > 0.0:
+        # The eyeball's centre of rotation, which no landmark marks, projected
+        # through the rigid frame. Measuring the iris displacement from there
+        # rather than from the corner midpoint is both steadier and closer to
+        # the quantity that actually matters.
+        center = (1.0 - blend) * center + blend * frame.eye_centre(side)
+        frame_axis = frame.eye_axis(side)
+        if flip_axis:
+            frame_axis = -frame_axis
+        unit_along = frame_axis
+        width = frame.eye_width_px
+
     unit_perp = np.array([-unit_along[1], unit_along[0]])  # +y is downwards
 
-    center = 0.5 * (outer_px + inner_px)
     iris_center = landmarks.pixels(iris_ids).mean(axis=0)
     offset = iris_center - center
 
@@ -208,20 +257,27 @@ def _mean_angle_deg(*angles: float) -> float:
 class FeatureExtractor:
     """Turns raw landmarks plus head pose into a :class:`FeatureVector`."""
 
+    def __init__(self, frame_blend: float = FRAME_BLEND) -> None:
+        self.frame_blend = float(frame_blend)
+
     def extract(self, landmarks: Optional[FaceLandmarks],
-                head_pose: Optional[HeadPose]) -> FeatureVector:
+                head_pose: Optional[HeadPose],
+                frame: Optional[FaceFrame] = None) -> FeatureVector:
         if landmarks is None or not landmarks.has_iris:
             return FeatureVector.invalid()
 
+        frame = frame if frame is not None else fit_face_frame(landmarks)
         left = _eye_features(
             landmarks, fl.EYE_LEFT_OUTER, fl.EYE_LEFT_INNER,
             [(fl.EYE_LEFT_TOP, fl.EYE_LEFT_BOTTOM), (fl.EYE_LEFT_TOP2, fl.EYE_LEFT_BOTTOM2)],
-            fl.IRIS_LEFT, flip_axis=False,
+            fl.IRIS_LEFT, flip_axis=False, side="left",
+            frame=frame, blend=self.frame_blend,
         )
         right = _eye_features(
             landmarks, fl.EYE_RIGHT_OUTER, fl.EYE_RIGHT_INNER,
             [(fl.EYE_RIGHT_TOP, fl.EYE_RIGHT_BOTTOM), (fl.EYE_RIGHT_TOP2, fl.EYE_RIGHT_BOTTOM2)],
-            fl.IRIS_RIGHT, flip_axis=True,
+            fl.IRIS_RIGHT, flip_axis=True, side="right",
+            frame=frame, blend=self.frame_blend,
         )
         if left is None or right is None:
             return FeatureVector.invalid()
