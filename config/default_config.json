@@ -27,7 +27,7 @@
   "calibration": {
     "pattern": "13point",
     "dwell_ms": 1500,
-    "settle_ms": 800,
+    "settle_ms": 1200,
     "samples_per_point": 40,
     "target_radius_px": 18,
     "poly_degree": 2,
@@ -63,7 +63,11 @@
     "quality_good_px": 0.0,
     "quality_fair_px": 0.0,
     "margin_fraction": 0.15,
-    "posture_guidance": true
+    "posture_guidance": true,
+    "posture_ms": 3500,
+    "posture_min_ms": 1500,
+    "posture_hold_ms": 500,
+    "posture_tolerance_deg": 6.0
   },
   "screen": {
     "monitor_index": 1,

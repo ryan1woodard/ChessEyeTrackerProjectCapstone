@@ -38,6 +38,78 @@ MIN_POINTS_FOR_FIT = 5
 MAD_THRESHOLD = 3.5
 GROSS_OUTLIER_Z = 12.0
 
+@dataclass(frozen=True)
+class Posture:
+    """A posture asked of the user at one calibration target.
+
+    ``roll_deg`` is a *target head tilt* in the same convention as
+    :class:`~src.tracking.head_pose.HeadPose`: positive tips the image-right
+    side of the face downwards, which is what happens when the user tips their
+    head towards their own left shoulder.
+
+    Holding the target as a number rather than as a sentence is what lets the
+    calibration screen show a live gauge of the user's actual tilt against it.
+    A sentence can be misread, and in testing it was: read at a glance, "tilt
+    left" is ambiguous about whose left, and there was nothing to correct
+    against. A needle the user moves into a zone cannot be misread, because
+    tilting the wrong way visibly moves it the wrong way.
+    """
+
+    label: str
+    #: Target head tilt in degrees, or 0.0 for the postures that are not tilts.
+    roll_deg: float = 0.0
+    #: What to do other than tilt: -1 nearer the screen, +1 further back.
+    lean: float = 0.0
+    #: Sideways shift: -1 to the user's left, +1 to their right.
+    shift: float = 0.0
+
+    #: How far "lean" moves the user, as a fraction of their seated distance.
+    #: About 7 cm at a 60 cm working distance -- enough for the model to learn
+    #: from, small enough to be comfortable to hold for a few seconds.
+    LEAN_FRACTION = 0.12
+
+    #: How far "shift" moves the user sideways, in interocular widths. One
+    #: interocular width is about 63 mm.
+    SHIFT_UNITS = 0.75
+
+    @property
+    def is_tilt(self) -> bool:
+        return abs(self.roll_deg) > 1.0
+
+    @property
+    def is_neutral(self) -> bool:
+        return not (self.is_tilt or self.lean or self.shift)
+
+    def matches(self, roll_deg: float, tolerance_deg: float) -> bool:
+        """Whether a measured head tilt counts as holding this posture."""
+        if not self.is_tilt:
+            return True
+        return abs(roll_deg - self.roll_deg) <= tolerance_deg
+
+    @property
+    def destination(self) -> str:
+        """A word for the far end of the travel gauge."""
+        if self.lean:
+            return "further back" if self.lean > 0 else "closer in"
+        if self.shift:
+            return "your right" if self.shift > 0 else "your left"
+        return "here"
+
+    def target_distance(self, baseline_z: float) -> float:
+        """The ``head_z`` this posture is asking for, given the user's normal one."""
+        return baseline_z * (1.0 + self.LEAN_FRACTION * self.lean)
+
+    def target_offset(self, baseline_x: float) -> float:
+        """The ``head_x`` this posture is asking for.
+
+        ``shift`` is signed in the user's own terms -- negative is their left --
+        and ``head_x`` is measured in the camera's, where the user's left is to
+        the image right. Hence the sign flip, in one place rather than at every
+        call site.
+        """
+        return baseline_x - self.SHIFT_UNITS * self.shift
+
+
 #: Posture asked of the user at each calibration target, in the order the
 #: targets are visited.
 #:
@@ -46,28 +118,28 @@ GROSS_OUTLIER_Z = 12.0
 #: and outside it the estimate is clamped to the edge of that range -- so a
 #: posture never sampled is a posture never compensated for. Someone who sits
 #: rigidly still gives the model no way to tell a tilted head from an upright
-#: one, and in the simulator that costs 235 px of error at a 20-degree tilt
-#: against 36 px upright.
+#: one, and in the simulator that costs 238 px of error at a 20-degree tilt
+#: against 22 px upright.
 #:
 #: Tilt appears the most often because it is the axis with the largest effect
 #: and the one users are least likely to vary on their own. Cues alternate
-#: direction so the samples straddle upright rather than sitting to one side,
-#: and every cue is small: this is asking for the range of postures someone
-#: adopts over an evening's play, not for a neck exercise.
-POSTURE_CUES: List[str] = [
-    "Sit as you normally would",
-    "Tilt your head slightly to the left",
-    "Tilt your head slightly to the right",
-    "Lean in a little closer",
-    "Sit back a little",
-    "Tilt your head left again, a bit more",
-    "Sit normally",
-    "Tilt your head right again, a bit more",
-    "Shift a little to your left",
-    "Shift a little to your right",
-    "Tilt your head slightly left",
-    "Tilt your head slightly right",
-    "Sit as you normally would",
+#: direction so the samples straddle upright rather than sitting to one side.
+#: The angles are small: 12 degrees is a glance at a clock on the wall, and 20
+#: is the most anyone is asked for.
+POSTURES: List[Posture] = [
+    Posture("Sit as you normally would"),
+    Posture("Tilt your head to the left", roll_deg=12.0),
+    Posture("Tilt your head to the right", roll_deg=-12.0),
+    Posture("Lean a little closer to the screen", lean=-1.0),
+    Posture("Sit back a little", lean=1.0),
+    Posture("Tilt further to the left", roll_deg=20.0),
+    Posture("Sit as you normally would"),
+    Posture("Tilt further to the right", roll_deg=-20.0),
+    Posture("Shift a little to your left", shift=-1.0),
+    Posture("Shift a little to your right", shift=1.0),
+    Posture("Tilt your head to the left", roll_deg=12.0),
+    Posture("Tilt your head to the right", roll_deg=-12.0),
+    Posture("Sit as you normally would"),
 ]
 
 #: Features whose range across the calibration samples is worth checking, with
@@ -82,9 +154,14 @@ COVERAGE_TARGETS: Dict[str, float] = {
 }
 
 
-def posture_cue(point_index: int) -> str:
+def posture(point_index: int) -> Posture:
     """The posture to ask for at a given calibration target."""
-    return POSTURE_CUES[point_index % len(POSTURE_CUES)]
+    return POSTURES[point_index % len(POSTURES)]
+
+
+def posture_cue(point_index: int) -> str:
+    """The wording of the posture asked for at a given calibration target."""
+    return posture(point_index).label
 
 
 # ------------------------------------------------------------------ patterns

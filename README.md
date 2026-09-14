@@ -121,21 +121,35 @@ python app.py --monitor 2     # track the second monitor
 
 ### 1. Calibrate
 
-Press **Start Tracking**, then **Calibrate**. A full-screen window shows 13
-targets one at a time. Look directly at each dot until its green ring fills.
+Press **Start Tracking**, then **Calibrate**. A full-screen window works
+through 13 points, and each one has two parts.
 
-**Each dot names a posture -- adopt it.** Above the target you will be asked to
-tilt your head a little to one side, lean in, or sit back. Do it, then keep
-your eyes on the dot while you hold it. This is counter-intuitive and it
-matters more than anything else in this document.
+**First you are asked to sit a certain way.** Tilt your head a little to one
+side, lean in, sit back. No dot is on screen for this part and nothing is being
+recorded, so there is time to read the instruction and act on it. A gauge shows
+your actual head tilt against the one being asked for -- move until the white
+line sits inside the blue band -- and the prompt turns green when you have it.
+The countdown says exactly when the dot will arrive, and `Space` skips ahead if
+you already have the posture.
 
-The tracker can only correct for head positions it has actually observed. A
-calibration recorded sitting rigidly still contains no information about how
-head movement and eye movement trade off, so the moment you tilt your head or
-shift in your chair the estimate degrades badly. Measured against the
-simulator, a 20 degree head tilt costs **238 px** of error after a still
-calibration and **22 px** after one that followed the prompts. Every posture
-asked for is a small one. Sit at your normal playing distance.
+Leaning and shifting are measured too, against your own resting position rather
+than against a fixed number, so those get a gauge as well. Nothing claims you
+have a posture right unless it was actually measured.
+
+**Then a red dot appears.** Look straight at it, keep holding the posture, and
+keep looking until its ring fills. The prompt shrinks to a small gauge beside
+the dot, close enough to catch out of the corner of your eye without looking
+away -- a glance at an instruction is a wasted sample.
+
+The tracker can only correct for head positions it has actually observed, which
+is what all of this is for. A calibration recorded sitting rigidly still
+contains no information about how head movement and eye movement trade off, so
+the moment you tilt your head or shift in your chair the estimate degrades
+badly. Measured against the simulator, a 20 degree head tilt costs **238 px** of
+error after a still calibration and **22 px** after one that followed the
+prompts. Every posture asked for is a small one -- 12 degrees is a glance at a
+clock on the wall, and 20 is the most you are asked for. Sit at your normal
+playing distance.
 
 Press `R` during a target to redo it, or `Esc` to cancel.
 
