@@ -24,7 +24,8 @@ from .face_tracker import FaceTracker
 from .features import FeatureExtractor, FeatureVector
 from .gaze_estimator import GazeEstimator, GazeResult
 from .head_pose import HeadPose, HeadPoseEstimator
-from .smoother import (FEATURE_SMOOTHING_PRESETS, FeatureSmoother, GazeSmoother)
+from .smoother import (FEATURE_SMOOTHING_PRESETS, FeatureSmoother, GazeSmoother,
+                       MedianPrefilter)
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +185,11 @@ class TrackingPipeline:
             smoothing_preset, FEATURE_SMOOTHING_PRESETS["medium"])
         self.feature_smoother = FeatureSmoother(feature_params["min_cutoff"],
                                                 feature_params["beta"])
+        #: Runs before the One Euro filters, on the same values. It exists for
+        #: the one thing they handle badly: an isolated frame where a landmark
+        #: is simply wrong, which One Euro reads as the onset of a saccade and
+        #: opens up to follow.
+        self.feature_prefilter = MedianPrefilter.from_preset(smoothing_preset)
         self.confidence = ConfidenceScorer(max_yaw, max_pitch, blink_threshold,
                                            max_roll=max_roll)
         self.blink_threshold = blink_threshold
@@ -340,7 +346,8 @@ class TrackingPipeline:
         if sample.eyes_closed:
             return sample
 
-        smoothed_values = self.feature_smoother.smooth(features.values, now)
+        despiked = self.feature_prefilter.filter(features.values)
+        smoothed_values = self.feature_smoother.smooth(despiked, now)
         smoothed = FeatureVector(values=smoothed_values, valid=True,
                                  left=features.left, right=features.right,
                                  head_pose=features.head_pose)
@@ -367,6 +374,7 @@ class TrackingPipeline:
     def _reset_filters(self) -> None:
         """Drop all per-frame filter state, keeping the calibration."""
         self.smoother.reset()
+        self.feature_prefilter.reset()
         self.feature_smoother.reset()
         self.confidence.reset()
         self._last_valid = None

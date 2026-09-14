@@ -25,7 +25,11 @@ from src.tracking.calibration import (COVERAGE_TARGETS, CalibrationSession,
                                       calibration_pattern,
                                       gaze_feature_columns, pattern_to_pixels,
                                       posture_cue, robust_filter)
+from src.tracking import face_tracker as fl
+from src.tracking.face_frame import fit_face_frame
 from src.tracking.face_tracker import FaceLandmarks
+from src.tracking.gaze_estimator import (polynomial_expand, ridge_fit,
+                                         robust_ridge_fit)
 from src.tracking.head_pose import HeadPoseEstimator
 from src.tracking.pipeline import TrackingPipeline
 from src.tracking.smoother import (FEATURE_SMOOTHING_PRESETS, SMOOTHING_PRESETS,
@@ -40,6 +44,7 @@ FPS = 30.0
 #: The shipped feature set: iris offsets on the camera's axes, the tilt that
 #: relates them to the head, and metric head position.
 FEATURES = ["iris_l_ix", "iris_l_iy", "iris_r_ix", "iris_r_iy",
+            "ray_l_x", "ray_l_y", "ray_r_x", "ray_r_y",
             "eye_tilt", "yaw", "pitch", "head_x", "head_y", "head_z"]
 
 #: The feature set this project shipped before head tilt was handled: iris
@@ -644,16 +649,284 @@ class TestTrackLossRecovery:
                         pipeline._last_valid[1] - before[1]) < 40
 
 
+class TestFaceFrame:
+    """The rigid fit is what the rest of the accuracy rests on."""
+
+    def test_the_reference_is_far_steadier_than_two_corners(self, simulator):
+        """71% of the variance in an iris offset used to come from here."""
+        corners, fitted = [], []
+        for _ in range(200):
+            marks = simulator.landmarks((960, 540), HeadState())
+            corners.append(0.5 * (marks.pixel(fl.EYE_LEFT_OUTER)
+                                  + marks.pixel(fl.EYE_LEFT_INNER)))
+            fitted.append(fit_face_frame(marks).eye_centre("left"))
+        corner_noise = float(np.linalg.norm(np.std(corners, axis=0)))
+        frame_noise = float(np.linalg.norm(np.std(fitted, axis=0)))
+        assert frame_noise < 0.6 * corner_noise, (
+            f"corners {corner_noise:.3f} px, frame {frame_noise:.3f} px")
+
+    def test_the_scale_is_steadier_still(self, simulator):
+        widths, fitted = [], []
+        for _ in range(200):
+            marks = simulator.landmarks((960, 540), HeadState())
+            widths.append(float(np.linalg.norm(marks.pixel(fl.EYE_LEFT_INNER)
+                                               - marks.pixel(fl.EYE_LEFT_OUTER))))
+            fitted.append(fit_face_frame(marks).eye_width_px)
+        assert np.std(fitted) < 0.25 * np.std(widths)
+
+    @pytest.mark.parametrize("shape_mm,limit", [(0.0, 2.0), (3.0, 4.0), (6.0, 6.0)])
+    def test_the_bias_is_nearly_rigid(self, shape_mm, limit):
+        """A canonical head is not the user's, and that is fine.
+
+        What matters is that the mismatch behaves like a fixed offset on the
+        head -- which calibration absorbs, as it does every other per-user
+        constant -- rather than shifting as the head turns, which it could not.
+
+        It is not perfectly rigid, and the limits say how far it moves: about
+        1.3 px across poses for a subject who matches the canonical head, and
+        growing with the mismatch. The residue is a smooth function of pose,
+        and pose is itself a model input, so the fit can account for what is
+        left.
+        """
+        poses = (HeadState(), HeadState(roll_deg=20), HeadState(roll_deg=-20),
+                 HeadState(yaw_deg=15), HeadState(z=520), HeadState(x=-60))
+        for seed in range(4):
+            clean = EyeSimulator(noise_px=0.0, shape_mm=shape_mm,
+                                 rng=np.random.default_rng(seed))
+            biases = []
+            for head in poses:
+                frame = fit_face_frame(clean.landmarks((960, 540), head))
+                offset = (frame.eye_centre("left")
+                          - clean.project(clean.eye_centre_world(head, "left")))
+                axis = frame.eye_axis("left")
+                # Resolved in the eye's own axes, a rigid bias reads the same
+                # in every pose however the head is turned.
+                biases.append([float(offset @ axis),
+                               float(offset @ np.array([-axis[1], axis[0]]))])
+            spread = np.ptp(np.array(biases), axis=0)
+            assert np.all(spread < limit), (
+                f"subject {seed}: bias moved by {spread.round(2)} px across poses")
+
+    def test_an_unusual_face_is_still_accepted(self):
+        """The gate is for landmarks that are not a face, not for faces that
+        are not the average."""
+        for shape in (0.0, 3.0, 6.0, 9.0):
+            sim = EyeSimulator(noise_px=0.35, shape_mm=shape,
+                               rng=np.random.default_rng(2))
+            frame = fit_face_frame(sim.landmarks((960, 540), HeadState()))
+            assert frame.valid, f"a face {shape} mm from canonical was rejected"
+
+    def test_nonsense_landmarks_are_rejected(self, simulator):
+        marks = simulator.landmarks((960, 540), HeadState())
+        scrambled = marks.points.copy()
+        rng = np.random.default_rng(0)
+        for index in fl.RIGID_FACE_LANDMARKS:
+            scrambled[index, :2] = rng.random(2)
+        assert not fit_face_frame(FaceLandmarks(
+            scrambled, marks.frame_width, marks.frame_height, True)).valid
+
+    def test_the_frame_survives_every_pose_it_will_meet(self, simulator):
+        for head in (HeadState(), HeadState(yaw_deg=35), HeadState(pitch_deg=25),
+                     HeadState(roll_deg=30), HeadState(z=750), HeadState(z=450)):
+            assert fit_face_frame(simulator.landmarks((960, 540), head)).valid
+
+
+class TestGazeRay:
+    """Turning the iris displacement back into an angle before fitting."""
+
+    def test_the_ray_is_linear_in_screen_position(self):
+        """A sphere gives sin(theta); a screen wants tan(theta)."""
+        clean = EyeSimulator(noise_px=0.0, shape_mm=0.0)
+        xs = np.array([200, 500, 960, 1400, 1700], dtype=float)
+        offsets = np.array([clean.features((x, 540)).values["iris_mean_ix"] for x in xs])
+        rays = np.array([clean.features((x, 540)).values["ray_mean_x"] for x in xs])
+
+        def straightness(values):
+            fit = np.polyfit(values, xs, 1)
+            return float(np.abs(xs - np.polyval(fit, values)).max())
+
+        assert straightness(rays) < 0.2 * straightness(offsets)
+        assert straightness(rays) < 2.0, "the ray should be almost exactly linear"
+
+    def test_the_ray_stays_finite_when_the_geometry_cannot_hold(self):
+        """Landmarks can put the iris further out than an eyeball allows."""
+        from src.tracking.features import _gaze_ray
+        for offset in (0.0, 0.2, 0.5, 5.0, -5.0):
+            x, y = _gaze_ray(offset, offset)
+            assert np.isfinite(x) and np.isfinite(y)
+
+    def test_both_frames_are_kept_because_the_radius_is_a_guess(self, simulator):
+        """The eyeball radius is a constant, and real eyes vary around it.
+
+        Rays alone degrade badly when the assumed radius is too small, because
+        the correction then bends the wrong way. Keeping the raw offsets
+        alongside gives the fit something unaffected to lean on.
+        """
+        names = set(FEATURES)
+        assert {"ray_l_x", "ray_l_y"} <= names
+        assert {"iris_l_ix", "iris_l_iy"} <= names
+
+
+class TestRobustFit:
+    """A glance away during calibration looks perfectly normal in features."""
+
+    @staticmethod
+    def _contaminated(rng, n=240, bad=20):
+        design = polynomial_expand(rng.normal(0, 1, (n, 2)), 2)
+        truth = design @ rng.normal(0, 1, (design.shape[1], 2))
+        observed = truth + rng.normal(0, 5, (n, 2))
+        observed[:bad] += 800.0            # frames aimed somewhere else
+        return design, observed, truth
+
+    def test_outliers_barely_move_the_robust_fit(self):
+        rng = np.random.default_rng(0)
+        design, observed, truth = self._contaminated(rng)
+        plain = np.hypot(*(design[20:] @ ridge_fit(design, observed, 1.0)
+                           - truth[20:]).T).mean()
+        robust = np.hypot(*(design[20:] @ robust_ridge_fit(design, observed, 1.0)
+                            - truth[20:]).T).mean()
+        assert robust < 0.3 * plain, f"plain {plain:.1f}, robust {robust:.1f}"
+
+    def test_it_costs_little_on_clean_data(self):
+        """Downweighting is not free, but it is cheap.
+
+        On this deliberately harsh synthetic case -- few samples, heavy noise --
+        it costs about 12% and never more than 40%. On a real calibration,
+        where there are hundreds of samples per fit, the end-to-end difference
+        measured 21.9 px against 21.7 px.
+        """
+        ratios = []
+        for seed in range(12):
+            rng = np.random.default_rng(seed)
+            design, observed, truth = self._contaminated(rng, bad=0)
+            plain = np.hypot(*(design @ ridge_fit(design, observed, 1.0) - truth).T).mean()
+            robust = np.hypot(*(design @ robust_ridge_fit(design, observed, 1.0)
+                                - truth).T).mean()
+            ratios.append(robust / plain)
+        assert np.mean(ratios) < 1.2, f"mean cost {np.mean(ratios):.3f}"
+        assert np.max(ratios) < 1.45, f"worst cost {np.max(ratios):.3f}"
+
+    def test_a_calibration_with_glances_still_works(self, simulator):
+        """The end-to-end case: the user looks away for a few frames a point."""
+        rng = np.random.default_rng(7)
+        session = CalibrationSession(FEATURES, SCREEN, alphas=ALPHAS)
+        targets = pattern_to_pixels(calibration_pattern("13point"), *SCREEN)
+        for point_id, target in enumerate(targets):
+            for _ in range(26):
+                head = HeadState().shifted(dx=rng.normal(0, 28), dz=rng.normal(0, 35),
+                                           droll=rng.normal(0, 8))
+                looked_at = target
+                if rng.random() < 0.08:
+                    looked_at = (rng.uniform(0, SCREEN[0]), rng.uniform(0, SCREEN[1]))
+                session.add(point_id, target, simulator.features(looked_at, head))
+        estimator = session.fit()
+        assert _mean_error(estimator, simulator, HeadState()) < 60
+
+
+class TestSpikeRejection:
+    """Frames where the iris landmarks are simply wrong.
+
+    Not a blink -- the eye is open and every other landmark is fine -- so
+    nothing upstream flags them. At 30 fps a reflection off glasses or a frame
+    of motion blur lasts one or two frames, so both cases are tested.
+    """
+
+    SPIKES = (120, 121, 180, 240, 241, 300)
+
+    def _run(self, estimator, simulator, prefilter: bool):
+        pipeline = _pipeline(estimator)
+        if not prefilter:
+            pipeline.feature_prefilter.window = 1
+        worst, settled = 0.0, []
+        for index in range(380):
+            features = (simulator.spoiled_features((960, 540)) if index in self.SPIKES
+                        else simulator.features((960, 540)))
+            sample = pipeline.process_features(features, index / FPS)
+            if sample.valid and index > 60:
+                error = np.hypot(sample.x - 960, sample.y - 540)
+                worst = max(worst, error)
+                if index > 320:
+                    settled.append(error)
+        return worst, float(np.mean(settled))
+
+    def test_a_spike_no_longer_throws_the_estimate(self, simulator, estimator):
+        without, _ = self._run(estimator, simulator, prefilter=False)
+        with_it, _ = self._run(estimator, simulator, prefilter=True)
+        assert without > 200, f"the spike should be visible without the median: {without:.0f}"
+        assert with_it < 60, f"worst excursion {with_it:.0f} px"
+
+    def test_the_window_is_long_enough_for_consecutive_bad_frames(self,
+                                                                  simulator, estimator):
+        """Why the default window is five rather than three.
+
+        A median of ``n`` absorbs a burst of ``(n - 1) / 2`` bad frames and
+        then fails abruptly. Two consecutive bad frames -- what a reflection
+        off glasses or a frame of motion blur lasts at 30 fps -- get past a
+        three-tap median whenever the two happen to err the same way, so its
+        typical excursion looks survivable and its bad case does not.
+
+        Measured on the distribution rather than on one draw, because which
+        case you get is a coin toss.
+        """
+        pipeline = _pipeline(estimator)
+        assert pipeline.feature_prefilter.window >= 5
+
+        def excursions(window, burst, trials=12):
+            peaks = []
+            for _ in range(trials):
+                pipe = _pipeline(estimator)
+                pipe.feature_prefilter.window = window
+                spikes = set(range(90, 90 + burst))
+                peak = 0.0
+                for index in range(170):
+                    features = (simulator.spoiled_features((960, 540))
+                                if index in spikes else simulator.features((960, 540)))
+                    sample = pipe.process_features(features, index / FPS)
+                    if sample.valid and index > 60:
+                        peak = max(peak, np.hypot(sample.x - 960, sample.y - 540))
+                peaks.append(peak)
+            return np.array(peaks)
+
+        pair_at_three = excursions(3, burst=2)
+        pair_at_five = excursions(5, burst=2)
+        assert pair_at_three.max() > 150, (
+            f"a pair should sometimes defeat a three-tap median: "
+            f"worst {pair_at_three.max():.0f} px")
+        assert pair_at_five.max() < 60, (
+            f"a five-tap median should absorb every pair: "
+            f"worst {pair_at_five.max():.0f} px")
+
+    def test_the_median_costs_almost_nothing_when_settled(self, simulator, estimator):
+        _, without = self._run(estimator, simulator, prefilter=False)
+        _, with_it = self._run(estimator, simulator, prefilter=True)
+        assert with_it < without + 3.0, f"{without:.1f} px -> {with_it:.1f} px"
+
+    def test_one_euro_alone_amplifies_a_spike(self):
+        """Why a median is needed at all.
+
+        One Euro widens its cutoff in proportion to the signal's speed, and a
+        one-frame spike is the fastest thing it ever sees, so it opens up and
+        follows it -- and stays open afterwards while its speed estimate decays.
+        """
+        from src.tracking.smoother import OneEuroFilter
+        filt = OneEuroFilter(**FEATURE_SMOOTHING_PRESETS["medium"])
+        for index in range(30):
+            steady = filt.filter(0.10, index / FPS)
+        spiked = filt.filter(0.95, 30 / FPS)
+        assert spiked - steady > 0.3, "the spike passed through barely filtered"
+
+
 class TestCalibrationFiltering:
     def test_head_features_are_exempt_from_outlier_rejection(self):
         """Head movement during calibration is data, not noise."""
         columns = gaze_feature_columns(FEATURES)
-        assert set(columns) == {0, 1, 2, 3}, "only the iris features are checked"
+        assert set(columns) == {0, 1, 2, 3, 4, 5, 6, 7}, \
+            "only the eye features are checked"
 
         rng = np.random.default_rng(5)
         samples = np.zeros((30, len(FEATURES)))
-        samples[:, :4] = rng.normal(0, 0.01, (30, 4))     # steady eyes
-        samples[:, 4:8] = rng.normal(0, 0.5, (30, 4))     # head moving a lot
+        samples[:, :8] = rng.normal(0, 0.01, (30, 8))     # steady eyes
+        samples[:, 9:13] = rng.normal(0, 0.5, (30, 4))    # head moving a lot
         mask = robust_filter(samples, columns=columns)
         assert mask.sum() >= 28, "deliberate head movement was thrown away"
 
@@ -661,8 +934,8 @@ class TestCalibrationFiltering:
         columns = gaze_feature_columns(FEATURES)
         rng = np.random.default_rng(6)
         samples = np.zeros((30, len(FEATURES)))
-        samples[:, :4] = rng.normal(0, 0.01, (30, 4))
-        samples[7, :4] = [0.9, -0.8, 0.9, -0.8]   # a blink mid-collection
+        samples[:, :8] = rng.normal(0, 0.01, (30, 8))
+        samples[7, :8] = [0.9, -0.8, 0.9, -0.8, 2.4, -2.1, 2.4, -2.1]  # a blink
         mask = robust_filter(samples, columns=columns)
         assert not mask[7]
 

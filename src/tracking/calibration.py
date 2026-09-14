@@ -258,8 +258,9 @@ def gaze_feature_columns(feature_names: Sequence[str]) -> List[int]:
     for "outliers" would throw away exactly the data that teaches the model to
     compensate for head movement.
     """
+    eye_prefixes = ("iris", "ray", "ear")
     return [index for index, name in enumerate(feature_names)
-            if name.startswith("iris") or name.startswith("ear")]
+            if name.startswith(eye_prefixes)]
 
 
 def robust_filter(samples: np.ndarray, threshold: float = MAD_THRESHOLD,

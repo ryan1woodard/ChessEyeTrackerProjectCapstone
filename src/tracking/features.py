@@ -55,6 +55,7 @@ the corner pair contributed 71% of the variance in the offset.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
@@ -74,6 +75,11 @@ FEATURE_NAMES: tuple[str, ...] = (
     "iris_l_ix", "iris_l_iy",
     "iris_r_ix", "iris_r_iy",
     "iris_mean_ix", "iris_mean_iy",
+    # The same direction as a tangent rather than a sine: linear in screen
+    # position where the raw offset is not.
+    "ray_l_x", "ray_l_y",
+    "ray_r_x", "ray_r_y",
+    "ray_mean_x", "ray_mean_y",
     "iris_vergence",
     "yaw", "pitch", "roll",
     "eye_tilt",
@@ -83,6 +89,40 @@ FEATURE_NAMES: tuple[str, ...] = (
 )
 
 _MIN_EYE_WIDTH_PX = 6.0
+
+#: Radius of the eyeball as a fraction of the corner-to-corner eye width:
+#: about 11 mm against 28.5 mm. It converts an iris displacement back into the
+#: angle that produced it.
+#:
+#: A fixed constant is enough. Getting it wrong stretches the angle scale
+#: smoothly and monotonically, which is exactly the kind of distortion the
+#: calibration polynomial exists to absorb; what it cannot absorb is the
+#: *shape* of the sine-versus-tangent mismatch, which this removes.
+EYEBALL_RADIUS_RATIO = 11.0 / 28.5
+
+
+def _gaze_ray(offset_x: float, offset_y: float) -> tuple[float, float]:
+    """Turn an iris displacement into the tangent of the gaze angle.
+
+    The iris rides on a sphere, so its visible displacement from the eyeball's
+    centre goes as ``r * sin(theta)``. A screen is a plane, so the position
+    looked at goes as ``distance * tan(theta)``. Feeding the raw displacement
+    to the model therefore asks a polynomial to approximate ``tan(asin(x))``
+    on top of everything else it is fitting -- a function that is nearly linear
+    in the middle and turns sharply at the edges, which is precisely where the
+    calibration targets are sparsest and the fit worst constrained.
+
+    Inverting the geometry here costs two square roots a frame and hands the
+    regression a quantity that is already proportional to screen displacement,
+    leaving it only the head geometry to account for.
+    """
+    radius = EYEBALL_RADIUS_RATIO
+    planar = offset_x * offset_x + offset_y * offset_y
+    # Beyond the eyeball's radius the geometry has no solution -- the landmarks
+    # are wrong rather than the eye being at 90 degrees -- so the angle is
+    # held just short of the limit instead of producing an infinity.
+    depth = math.sqrt(max(radius * radius - planar, (0.15 * radius) ** 2))
+    return offset_x / depth, offset_y / depth
 
 #: Nominal half-range of each feature, used to scale the model's inputs.
 #:
@@ -104,6 +144,9 @@ NOMINAL_SCALES: Dict[str, float] = {
     "iris_l_ix": 0.18, "iris_l_iy": 0.14,
     "iris_r_ix": 0.18, "iris_r_iy": 0.14,
     "iris_mean_ix": 0.18, "iris_mean_iy": 0.14,
+    "ray_l_x": 0.50, "ray_l_y": 0.40,
+    "ray_r_x": 0.50, "ray_r_y": 0.40,
+    "ray_mean_x": 0.50, "ray_mean_y": 0.40,
     "iris_vergence": 0.10,
     "yaw": 0.45, "pitch": 0.45, "roll": 0.45,
     "eye_tilt": 0.45,
@@ -132,6 +175,8 @@ class EyeFeatures:
     iris_y: float
     iris_ix: float
     iris_iy: float
+    ray_x: float
+    ray_y: float
     tilt_deg: float
     openness: float
     width_px: float
@@ -235,11 +280,16 @@ def _eye_features(landmarks: FaceLandmarks, outer: int, inner: int,
     # HeadPose.roll.
     tilt_deg = float(np.degrees(np.arctan2(unit_along[1], unit_along[0])))
 
+    offset_ix, offset_iy = float(offset[0] / width), float(offset[1] / width)
+    ray_x, ray_y = _gaze_ray(offset_ix, offset_iy)
+
     return EyeFeatures(
         iris_x=float(np.dot(offset, unit_along) / width),
         iris_y=float(np.dot(offset, unit_perp) / width),
-        iris_ix=float(offset[0] / width),
-        iris_iy=float(offset[1] / width),
+        iris_ix=offset_ix,
+        iris_iy=offset_iy,
+        ray_x=ray_x,
+        ray_y=ray_y,
         tilt_deg=tilt_deg,
         openness=openness,
         width_px=width,
@@ -313,6 +363,12 @@ class FeatureExtractor:
             "iris_r_iy": right.iris_iy,
             "iris_mean_ix": 0.5 * (left.iris_ix + right.iris_ix),
             "iris_mean_iy": 0.5 * (left.iris_iy + right.iris_iy),
+            "ray_l_x": left.ray_x,
+            "ray_l_y": left.ray_y,
+            "ray_r_x": right.ray_x,
+            "ray_r_y": right.ray_y,
+            "ray_mean_x": 0.5 * (left.ray_x + right.ray_x),
+            "ray_mean_y": 0.5 * (left.ray_y + right.ray_y),
             # Vergence carries weak depth information and helps separate
             # "looking near the centre" from "looking past the screen".
             "iris_vergence": left.iris_x - right.iris_x,

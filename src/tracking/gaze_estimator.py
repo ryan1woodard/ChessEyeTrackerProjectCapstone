@@ -97,17 +97,69 @@ def polynomial_expand(x: np.ndarray, degree: int) -> np.ndarray:
     return np.column_stack(columns)
 
 
-def ridge_fit(design: np.ndarray, targets: np.ndarray, alpha: float) -> np.ndarray:
-    """Solve ridge regression, leaving the bias (column 0) unpenalised."""
+def ridge_fit(design: np.ndarray, targets: np.ndarray, alpha: float,
+              weights: Optional[np.ndarray] = None) -> np.ndarray:
+    """Solve ridge regression, leaving the bias (column 0) unpenalised.
+
+    ``weights`` gives a per-sample weight; see :func:`robust_ridge_fit`.
+    """
     n_terms = design.shape[1]
     penalty = np.eye(n_terms, dtype=np.float64) * float(alpha)
     penalty[0, 0] = 0.0
-    gram = design.T @ design + penalty
-    rhs = design.T @ targets
+    if weights is None:
+        gram = design.T @ design + penalty
+        rhs = design.T @ targets
+    else:
+        weighted = design * weights[:, None]
+        gram = weighted.T @ design + penalty
+        rhs = weighted.T @ targets
     try:
         return np.linalg.solve(gram, rhs)
     except np.linalg.LinAlgError:  # pragma: no cover - singular design
         return np.linalg.lstsq(gram, rhs, rcond=None)[0]
+
+
+#: Residual, in units of the robust spread, beyond which a calibration sample
+#: stops counting in full. The classic Huber value.
+HUBER_K = 1.345
+
+#: Reweighting passes. The weights settle in two or three; more is wasted work.
+ROBUST_PASSES = 3
+
+
+def robust_ridge_fit(design: np.ndarray, targets: np.ndarray, alpha: float,
+                     passes: int = ROBUST_PASSES) -> np.ndarray:
+    """Ridge regression that a handful of bad frames cannot drag off course.
+
+    Least squares weights a sample by the square of its error, so one frame
+    where the user glanced away during collection pulls the fit further than
+    fifty good ones hold it. The outlier filter in
+    :mod:`~src.tracking.calibration` catches the frames that look wrong in
+    *feature* space -- a blink, a lost iris -- but it cannot see the ones that
+    look perfectly normal and are simply aimed somewhere else, because nothing
+    about those features is unusual. Only the fit residual reveals them.
+
+    So the fit is repeated, each pass weighting samples by how well the
+    previous one predicted them: in full inside a Huber radius of the robust
+    spread of residuals, and falling off as 1/residual beyond it. A glance away
+    ends up contributing a fraction of a sample instead of dominating its
+    target.
+    """
+    weights = None
+    coefficients = ridge_fit(design, targets, alpha)
+    for _ in range(max(passes, 1)):
+        residuals = np.hypot(*(design @ coefficients - targets).T)
+        # Median absolute deviation, scaled to a standard deviation for normal
+        # data. Using the plain standard deviation here would be self-defeating:
+        # the outliers this exists to find would inflate it and then look normal.
+        median = float(np.median(residuals))
+        spread = float(np.median(np.abs(residuals - median))) / 0.6745
+        if spread < 1e-9:
+            break
+        scaled = residuals / (HUBER_K * spread)
+        weights = np.where(scaled <= 1.0, 1.0, 1.0 / np.maximum(scaled, 1e-9))
+        coefficients = ridge_fit(design, targets, alpha, weights)
+    return coefficients
 
 
 @dataclass(frozen=True)
@@ -392,7 +444,7 @@ class RidgeGazeEstimator(GazeEstimator):
                 held_out = groups == group
                 if held_out.all():
                     continue
-                weights = ridge_fit(design[~held_out], targets[~held_out], alpha)
+                weights = robust_ridge_fit(design[~held_out], targets[~held_out], alpha)
                 predicted = design[held_out] @ weights
                 actual = targets[held_out]
                 # Two different questions, both worth answering.
@@ -439,7 +491,7 @@ class RidgeGazeEstimator(GazeEstimator):
 
         input_low, input_high = cls.input_range(raw_features, feature_names)
 
-        weights = ridge_fit(design, targets, best.alpha)
+        weights = robust_ridge_fit(design, targets, best.alpha)
         train_predictions = design @ weights
         train_error = float(np.mean(np.hypot(*(train_predictions - targets).T)))
 

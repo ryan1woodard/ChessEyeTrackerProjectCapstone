@@ -369,6 +369,31 @@ class EyeSimulator:
         return FaceLandmarks(points, self.frame_width, self.frame_height, has_iris=True)
 
     # ------------------------------------------------------------- features
+    def spoiled_features(self, target_px: Tuple[float, float],
+                         head: Optional[HeadState] = None,
+                         spike_px: float = 6.0) -> FeatureVector:
+        """One frame in which the iris landmarks are badly misplaced.
+
+        Detectors do this: an eyelash, a reflection off glasses or a frame of
+        motion blur, and the iris is reported several pixels from where it is
+        for exactly one frame. It is not a blink -- the eye is open and every
+        other landmark is fine -- so nothing about the frame looks wrong except
+        the answer it produces.
+        """
+        marks = self.landmarks(target_px, head)
+        direction = self.rng.normal(0.0, 1.0, 2)
+        direction /= max(float(np.linalg.norm(direction)), 1e-9)
+        shift = direction * spike_px
+        points = marks.points.copy()
+        for index in fl.IRIS_LEFT + fl.IRIS_RIGHT:
+            points[index, 0] += shift[0] / self.frame_width
+            points[index, 1] += shift[1] / self.frame_height
+        spoiled = FaceLandmarks(points, marks.frame_width, marks.frame_height,
+                                has_iris=True)
+        frame = fit_face_frame(spoiled)
+        return self.extractor.extract(spoiled, self.pose_estimator.estimate(spoiled, frame),
+                                      frame)
+
     def features(self, target_px: Tuple[float, float],
                  head: Optional[HeadState] = None,
                  blink_bias_mm: float = 0.0) -> FeatureVector:
