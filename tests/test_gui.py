@@ -316,8 +316,19 @@ class TestCalibrationWindow:
         window._head_roll = 0.0
         assert not window._collect_finished(), "a still head finished the dot"
 
+        # Tilting alone is not enough, and that is the point: a single ring
+        # could be filled by rocking the head without ever turning it, which is
+        # the calibration that leaves head-turn untracked.
         for roll in range(-18, 19, 2):
-            window._coverage.observe(roll)
+            window._coverage.observe(roll, 0.0, 0.0)
+        assert not window._collect_finished(), "tilting alone finished the dot"
+
+        for yaw in range(-20, 21, 2):
+            window._coverage.observe(0.0, yaw, 0.0)
+        assert not window._collect_finished(), "still nothing asked of nodding"
+
+        for pitch in range(-12, 13, 2):
+            window._coverage.observe(0.0, 0.0, pitch)
         assert window._collect_finished()
 
     def test_explore_never_waits_forever(self, qapp, tmp_path):
@@ -349,7 +360,7 @@ class TestCalibrationWindow:
                 features=FeatureVector(values=values, valid=True)))
         assert window._collected > window._quota
 
-    def test_the_coverage_ring_tracks_the_tilts_seen(self, qapp, tmp_path):
+    def test_the_coverage_rings_track_every_axis(self, qapp, tmp_path):
         from src.gui.calibration_window import CalibrationWindow, PHASE_COLLECT
         from src.tracking.features import FeatureVector
         from src.tracking.head_pose import HeadPose
@@ -359,11 +370,24 @@ class TestCalibrationWindow:
         window = CalibrationWindow(config, Rect(0, 0, 1000, 800), 1, 0)
         window._phase = PHASE_COLLECT
         assert window._coverage.fraction == 0.0
-        for roll in range(-18, 19, 2):
+
+        def feed(roll, yaw, pitch=0):
             window.on_sample(GazeSample(
                 timestamp=0.0, face_detected=True,
-                head_pose=HeadPose(pitch=0.0, yaw=0.0, roll=float(roll)),
+                head_pose=HeadPose(pitch=float(pitch), yaw=float(yaw), roll=float(roll)),
                 features=FeatureVector(values={"ear_l": 0.3, "ear_r": 0.3}, valid=True)))
+
+        for roll in range(-18, 19, 2):
+            feed(roll, 0)
+        assert window._coverage.axis_fraction("tilt") == 1.0
+        assert not window._coverage.complete, "tilt alone should not complete it"
+
+        for yaw in range(-20, 21, 2):
+            feed(0, yaw)
+        assert not window._coverage.complete, "nodding was never asked for"
+
+        for pitch in range(-12, 13, 2):
+            feed(0, 0, pitch)
         assert window._coverage.complete
 
     def test_the_method_can_be_switched_from_the_intro(self, qapp, tmp_path):

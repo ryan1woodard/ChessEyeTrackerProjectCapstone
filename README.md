@@ -127,13 +127,23 @@ Press **Start Tracking**, then **Calibrate**. There are two ways to do it, and
 #### Move your head (the default)
 
 Look straight at each dot and **keep looking at it**, while your head keeps
-moving: roll it slowly side to side, lean in and back, shift a little left and
-right. Do not try to hold still, and do not try to hit any particular position.
-Just keep moving, gently, the whole time.
+moving three ways:
 
-A ring around each dot fills in as your head covers new angles, and the dot
-moves on when it is full -- so the feedback is on the dot you are already
-staring at, and you never look away to check it. About a minute in total.
+- **Tilt** it side to side, ear towards shoulder.
+- **Turn** it left and right, as if glancing at someone beside you.
+- **Nod** it up and down.
+
+Lean in and back too. Do not try to hold still, and do not try to hit any
+particular position. Just keep moving, gently, the whole time.
+
+Three rings around each dot fill in as you go, one per movement. All three must
+fill before the dot moves on, so if one is stuck, that is the movement to do
+more of. The feedback is on the dot you are already staring at, so you never
+look away to check it. About a minute in total.
+
+Turning and nodding are not optional extras. A calibration that never sees your
+head turned cannot correct for a turned head, and that showed up as the most
+common complaint about this tracker: tilting worked, turning did not.
 
 #### Hold a posture (quicker)
 
@@ -407,6 +417,67 @@ error of the best is chosen. With only 13 points the minimum is noisy, and the
 simpler model extrapolates far better outside the calibrated region -- which is
 where a gaze tracker spends most of its time.
 
+**The head rotation is applied geometrically, not learned.** This was the
+tracker's largest single fault and the hardest to see, because it presented as
+"tilting my head works, turning it does not".
+
+Head *roll* is an in-plane rotation, so an iris offset measured on the camera's
+axes already absorbs it and a polynomial has almost nothing left to learn. Head
+*turn* is a three-dimensional rotation, and a degree-2 polynomial can only
+approximate one over the range it was shown -- which was almost none, because
+the calibration prompt asked for tilting, leaning and shifting and never for
+turning. Measured in the simulator, the old mapping was worth 13 px of error
+facing the camera and **180-200 px at 30 degrees of head turn**.
+
+The fix follows the standard model-based formulation from the gaze-estimation
+literature (Sugano's data normalization, and the eyeball-model gaze work):
+
+1. a full perspective pose puts the eyeball's centre of rotation at a real
+   point in space, in millimetres;
+2. the iris landmark is back-projected into a ray and intersected with the
+   eyeball sphere, giving the iris centre in space;
+3. the line between them is the **optical axis** -- where the eye points, with
+   head pose accounted for by construction rather than by approximation;
+4. intersecting it with the screen plane gives a position that is already
+   nearly right, and is *pose-invariant*: the same screen target reads the same
+   whether the head is square on or turned 30 degrees.
+
+What is left for calibration is the part that genuinely is per-person: *kappa*,
+the few degrees between where the eye points and where the person is looking,
+because the fovea is not on the optical axis; and where the eyeball's centre
+actually sits, which is not where the average one does. Both are supplied to
+the fit as **response vectors** -- how far the screen estimate moves per radian
+of kappa, and per millimetre of centre error -- which makes them linear
+coefficients the existing ridge solves for, with no separate optimiser.
+
+The eyeball centre matters more than it looks, and the reason is the lever arm:
+the centre and the iris are only about 11 mm apart, so a 2 mm error in where
+the centre is taken to be is roughly ten degrees of gaze. Fixed in the head's
+frame, it swings sideways as the head turns. With an otherwise perfect head
+pose, a 2 mm mismatch was worth 253 px of drift at 30 degrees of turn.
+
+**The pose solver has to be seeded.** A face is close enough to planar that
+`solvePnP` has a second, mirrored solution, and it finds it: on a subject 3 mm
+from the canonical head it returned a head position *behind the camera* at 20
+and 30 degrees of turn. The weak-perspective frame cannot diverge, so it is
+used as the starting point, and any solution still behind the camera is
+rejected.
+
+**Calibration has to ask for head turning, and check that it got it.** No
+modelling change came close to the value of simply asking:
+
+| head turn asked for during calibration | error at 30 degrees of turn |
+|---|---|
+| ±3° (the old prompt, which never asked) | 207 px |
+| ±10° | 94 px |
+| ±18° | 52 px |
+| ±25° | 35 px |
+
+So the explore method now asks for three movements -- tilt, turn and nod -- and
+draws one coverage ring per axis around the dot. All three must fill. A single
+ring could be filled by rocking the head side to side without ever turning it,
+which is exactly the calibration that leaves head-turn untracked.
+
 **Calibration has to decorrelate head position from screen position.** Because
 the camera sees eye rotation relative to the *head*, head rotation and eye
 rotation trade off against each other: the same iris offset points at different
@@ -428,6 +499,18 @@ than to adopt a pose, which unties the two by construction and is also a much
 easier instruction to follow correctly. The posture method remains for people
 who want it faster.
 
+**Vertical gaze is harder than horizontal, and the eyelid is why.** The upper
+lid tracks the eye as it moves down and retracts as it moves up, and it cuts
+across the iris, so the detected iris centre carries a bias that changes with
+vertical gaze. This is a documented result for video-based eye tracking, not a
+quirk of this implementation. Modelled in the simulator, occlusion leaves only
+77% of the vertical signal and adds a gaze-dependent bias on top.
+
+The lid aperture is therefore a model input rather than only a blink signal: it
+measures where the lid is, which is what causes the bias, so the fit can undo
+it. Together with asking for head nodding during calibration, error at a
+pitched head went from 45 px to 16 px.
+
 **Coverage is checked per dot, not pooled.** The distinction is the whole value
 of the check. A run that holds a different fixed posture at each dot shows
 plenty of head movement overall while being one of the worst arrangements
@@ -442,6 +525,16 @@ there is. Measured per dot, it does not:
 
 The per-dot column orders with the error. The pooled one rates the 42 px case
 above the 25 px one.
+
+**Cross-validation holds out head poses, not only screen targets.** Holding
+out a target says nothing about head pose: a model that has quietly learned to
+read the target off the head still predicts a held-out target correctly,
+because the poses it saw there are in the training data for every other target.
+That is how a calibration can report 13 px while being worth 62 px in use. A
+second holdout sorts the samples by whichever pose axis varied most and holds
+back a contiguous *range* of them, which is the figure that tracks what happens
+when the user moves. Quality is rated on whichever of the two is worse, because
+a rating that flatters is worse than one that is strict.
 
 **The report says what went wrong, not just how bad it was.** "POOR" on its own
 is not something a user can act on. The fit reports per-dot coverage on each

@@ -53,6 +53,8 @@ from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
 
+import cv2
+
 from . import face_tracker as fl
 from .face_tracker import FaceLandmarks
 
@@ -219,6 +221,101 @@ class FaceFrame:
         axis = self.direction((1.0, 0.0, 0.0))
         roll = math.degrees(math.atan2(float(axis[1]), float(axis[0])))
         return pitch, yaw, roll
+
+
+@dataclass(frozen=True)
+class HeadPlacement:
+    """Where the head is in front of the camera, in millimetres.
+
+    A full perspective pose, unlike :class:`FaceFrame`: it carries a real
+    rotation and a real distance, which is what a gaze *ray* needs. The frame
+    alone cannot give either, because scaled orthographic projection has thrown
+    away the depth that distinguishes a near small head from a far large one.
+    """
+
+    rotation: np.ndarray          # (3, 3), head-local to camera
+    translation: np.ndarray       # (3,), camera millimetres
+    valid: bool = True
+
+    @classmethod
+    def invalid(cls) -> "HeadPlacement":
+        return cls(np.eye(3), np.array([0.0, 0.0, 600.0]), valid=False)
+
+    def to_camera(self, point_mm: Sequence[float]) -> np.ndarray:
+        """A canonical head point in camera millimetres."""
+        return self.rotation @ np.asarray(point_mm, dtype=np.float64) + self.translation
+
+    @property
+    def distance_mm(self) -> float:
+        return float(self.translation[2])
+
+
+def camera_matrix(width: int, height: int) -> np.ndarray:
+    """A generic pinhole intrinsic matrix; focal length approximated by width.
+
+    Wrong for any particular webcam, and it matters less than it looks: a focal
+    length error scales the recovered distance, and calibration absorbs a
+    constant scale. What it must not do is vary between frames, and it does not.
+    """
+    focal = float(width)
+    return np.array([[focal, 0.0, width / 2.0],
+                     [0.0, focal, height / 2.0],
+                     [0.0, 0.0, 1.0]], dtype=np.float64)
+
+
+def solve_head_placement(landmarks: FaceLandmarks,
+                         frame: Optional["FaceFrame"] = None) -> HeadPlacement:
+    """Full perspective pose of the head, in camera millimetres.
+
+    Seeded from the weak-perspective frame rather than started cold, because
+    ``solvePnP`` on a face is close enough to a planar problem to have a second,
+    mirrored solution -- and it does find it. Measured on a subject 3 mm from
+    the canonical head, an unseeded solve returned a pose *behind the camera*
+    (z of -608 mm) at 20 and 30 degrees of yaw, with the yaw itself out by
+    seven degrees. The weak-perspective fit cannot diverge, so it makes a good
+    starting point, and any solution that still comes back behind the camera is
+    rejected rather than used.
+    """
+    if landmarks.points.shape[0] <= max(_RIGID_IDS):
+        return HeadPlacement.invalid()
+    observed = landmarks.pixels(_RIGID_IDS)
+    if observed.shape[0] < MIN_RIGID_POINTS or not np.all(np.isfinite(observed)):
+        return HeadPlacement.invalid()
+
+    frame = frame if frame is not None else fit_face_frame(landmarks)
+    camera = camera_matrix(landmarks.frame_width, landmarks.frame_height)
+    distortion = np.zeros((4, 1), dtype=np.float64)
+
+    guess_rvec = guess_tvec = None
+    if frame.valid and frame.scale > 1e-6:
+        rotation = frame.rotation()
+        # Scaled orthographic scale is focal / distance, so this inverts it.
+        depth = float(camera[0, 0]) / frame.scale
+        centre = frame.offset - camera[:2, 2]
+        guess_rvec = cv2.Rodrigues(rotation)[0]
+        guess_tvec = np.array([[centre[0] * depth / camera[0, 0]],
+                               [centre[1] * depth / camera[1, 1]],
+                               [depth]], dtype=np.float64)
+
+    try:
+        ok, rvec, tvec = cv2.solvePnP(
+            _RIGID_MODEL, observed, camera, distortion,
+            rvec=guess_rvec, tvec=guess_tvec,
+            useExtrinsicGuess=guess_rvec is not None,
+            flags=cv2.SOLVEPNP_ITERATIVE,
+        )
+    except cv2.error:  # pragma: no cover - degenerate geometry
+        return HeadPlacement.invalid()
+    if not ok:
+        return HeadPlacement.invalid()
+
+    translation = np.asarray(tvec, dtype=np.float64).ravel()
+    rotation, _ = cv2.Rodrigues(rvec)
+    # A head behind the camera, or implausibly close or far, is the mirrored
+    # solution rather than a person who has moved.
+    if not (150.0 < translation[2] < 2000.0):
+        return HeadPlacement.invalid()
+    return HeadPlacement(rotation=rotation, translation=translation, valid=True)
 
 
 def fit_face_frame(landmarks: FaceLandmarks) -> FaceFrame:

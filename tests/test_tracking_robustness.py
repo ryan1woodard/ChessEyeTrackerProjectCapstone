@@ -18,22 +18,24 @@ caught here.
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import numpy as np
 import pytest
 
 from src.tracking.blink import BlinkDetector
 from src.tracking.calibration import (COVERAGE_TARGETS, MAX_TARGET_CORRELATION,
-                                      EXPLORE_ROLL_RANGE, CalibrationSession,
+                                      EXPLORE_RANGES, CalibrationSession,
                                       PoseCoverage, calibration_pattern,
                                       gaze_feature_columns, pattern_to_pixels,
                                       posture, posture_cue, robust_filter)
 from src.tracking import face_tracker as fl
-from src.tracking.face_frame import fit_face_frame
+from src.tracking.face_frame import fit_face_frame, solve_head_placement
 from src.tracking.face_tracker import FaceLandmarks
 from src.tracking.gaze_estimator import (polynomial_expand, ridge_fit,
                                          robust_ridge_fit)
 from src.tracking.head_pose import HeadPoseEstimator
+from src.utils.config import Config
 from src.tracking.pipeline import TrackingPipeline
 from src.tracking.smoother import (FEATURE_SMOOTHING_PRESETS, SMOOTHING_PRESETS,
                                    FeatureSmoother, GazeSmoother)
@@ -44,11 +46,12 @@ from tests.simulator import (EyeSimulator, HeadState, probe_targets,
 SCREEN = (1920, 1080)
 FPS = 30.0
 
-#: The shipped feature set: iris offsets on the camera's axes, the tilt that
-#: relates them to the head, and metric head position.
-FEATURES = ["iris_l_ix", "iris_l_iy", "iris_r_ix", "iris_r_iy",
-            "ray_l_x", "ray_l_y", "ray_r_x", "ray_r_y",
-            "eye_tilt", "yaw", "pitch", "head_x", "head_y", "head_z"]
+#: The shipped feature set, read from the config the application uses rather
+#: than copied here. A test that pins its own list quietly stops testing what
+#: ships the first time the two diverge, which is how this one spent a round
+#: measuring a feature set nobody was running.
+FEATURES = list(Config.load(user_path=Path("/nonexistent"))
+                .get("calibration.model_features"))
 
 #: The feature set this project shipped before head tilt was handled: iris
 #: offsets in the eye's own frame, which are roll-invariant by construction.
@@ -60,14 +63,37 @@ PROBES = probe_targets(SCREEN, grid=3)
 
 #: Head positions a calibration has to survive, used where the question is how
 #: well one generalises rather than how it does where it was recorded.
+#:
+#: Turning the head is in here because it is what people actually do at a
+#: screen and what this tracker was worst at. An evaluation set that stopped at
+#: 10 degrees of yaw, as this one once did, reported everything as fine while
+#: users were seeing the estimate slide off as soon as they looked round.
 HARD_POSES = [
     ("neutral", HeadState()),
     ("tilt +18", HeadState(roll_deg=18)),
     ("tilt -18", HeadState(roll_deg=-18)),
+    ("turn +25", HeadState(yaw_deg=25)),
+    ("turn -25", HeadState(yaw_deg=-25)),
+    ("nod +12", HeadState(pitch_deg=12)),
     ("lean in", HeadState(z=540)),
     ("sit back", HeadState(z=690)),
     ("shift left", HeadState(x=-50)),
 ]
+
+
+def _roaming_head(moment: float, effort: float = 1.0) -> HeadState:
+    """A head that keeps moving on every axis, as the explore prompt asks.
+
+    Turning is here deliberately. A calibration that never sees the head turn
+    cannot correct for a turned head, which was this tracker's largest fault.
+    """
+    return HeadState(
+        x=34 * effort * math.sin(2 * math.pi * moment / 2.9),
+        y=60 + 18 * effort * math.sin(2 * math.pi * moment / 3.7 + 1.0),
+        z=600 + 55 * effort * math.sin(2 * math.pi * moment / 4.3 + 2.0),
+        yaw_deg=20 * effort * math.sin(2 * math.pi * moment / 3.1 + 0.5),
+        pitch_deg=13 * effort * math.sin(2 * math.pi * moment / 2.3 + 1.5),
+        roll_deg=17 * effort * math.sin(2 * math.pi * moment / 2.0 + 0.3))
 
 
 def _calibrate(simulator: EyeSimulator, features, rng: np.random.Generator,
@@ -79,7 +105,7 @@ def _calibrate(simulator: EyeSimulator, features, rng: np.random.Generator,
         for _ in range(samples):
             head = HeadState().shifted(
                 dx=rng.normal(0, 28 * motion), dy=rng.normal(0, 20 * motion),
-                dz=rng.normal(0, 35 * motion), dyaw=rng.normal(0, 4.5 * motion),
+                dz=rng.normal(0, 35 * motion), dyaw=rng.normal(0, 9.0 * motion),
                 dpitch=rng.normal(0, 3.5 * motion),
                 droll=rng.normal(0, 8.0 * tilt))
             session.add(point_id, target, simulator.features(target, head))
@@ -745,8 +771,87 @@ class TestFaceFrame:
             assert fit_face_frame(simulator.landmarks((960, 540), head)).valid
 
 
+class TestHeadPlacement:
+    """The perspective pose: a real rotation and a real distance."""
+
+    @pytest.mark.parametrize("shape_mm", [0.0, 3.0, 6.0])
+    def test_it_does_not_flip_behind_the_camera(self, shape_mm):
+        """Unseeded, solvePnP found the mirrored solution and used it.
+
+        A face is nearly planar, so the problem has a second solution with the
+        head behind the camera. On a subject 3 mm from the canonical head it
+        returned a distance of -608 mm at 20 degrees of yaw, with the yaw out
+        by seven degrees. Seeding from the weak-perspective fit, which cannot
+        diverge, is what stops it.
+        """
+        sim = EyeSimulator(noise_px=0.35, shape_mm=shape_mm,
+                           rng=np.random.default_rng(5))
+        for yaw in (-30, -15, 0, 15, 30):
+            marks = sim.landmarks((960, 540), HeadState(yaw_deg=yaw))
+            placement = solve_head_placement(marks, fit_face_frame(marks))
+            assert placement.valid, f"no pose at {yaw} deg"
+            assert 400 < placement.distance_mm < 800, (
+                f"{yaw} deg gave a distance of {placement.distance_mm:.0f} mm")
+
+    def test_it_tracks_a_real_head_turn(self, simulator):
+        """A constant per-subject offset is fine; the slope is what matters."""
+        angles, reported = [], []
+        for yaw in (-30, -20, -10, 0, 10, 20, 30):
+            marks = simulator.landmarks((960, 540), HeadState(yaw_deg=yaw))
+            placement = solve_head_placement(marks, fit_face_frame(marks))
+            # Recover the yaw the same way HeadPose defines it.
+            angles.append(yaw)
+            # HeadPose yaw is +asin(R[2, 0]) in this convention.
+            reported.append(math.degrees(math.asin(
+                float(np.clip(placement.rotation[2, 0], -1.0, 1.0)))))
+        slope = float(np.polyfit(angles, reported, 1)[0])
+        assert 0.85 < slope < 1.15, f"turn tracked at {slope:.2f} of its true size"
+
+
 class TestGazeRay:
     """Turning the iris displacement back into an angle before fitting."""
+
+    def test_the_ray_is_pose_invariant(self):
+        """The whole point: the same screen target reads the same however the
+        head is turned.
+
+        This is what a polynomial could not be taught, because calibration
+        never showed it a head turned thirty degrees. Doing the rotation
+        geometrically makes it true by construction instead.
+        """
+        clean = EyeSimulator(noise_px=0.0, shape_mm=0.0)
+        target = (300, 300)
+
+        def slope(head):
+            pairs = []
+            for x in (200, 700, 1200, 1700):
+                values = clean.features((x, 300), head).values
+                pairs.append(((x - 960) / 1920.0, values["plane_x"]))
+            return float(np.polyfit([p[0] for p in pairs],
+                                    [p[1] for p in pairs], 1)[0])
+
+        upright = slope(HeadState())
+        for yaw in (-30, -15, 15, 30):
+            turned = slope(HeadState(yaw_deg=yaw))
+            assert turned == pytest.approx(upright, rel=0.15), (
+                f"sensitivity changed by {abs(turned / upright - 1) * 100:.0f}% "
+                f"at {yaw} deg of turn")
+        assert clean.features(target, HeadState()).values["plane_x"] < 0
+
+    def test_a_missing_pose_falls_back_rather_than_poisoning_the_frame(self):
+        """Every ray feature has to read something the polynomial can use.
+
+        A NaN would propagate through every product term in the expansion; a
+        large number would be extrapolation. Zero means "middle of the screen",
+        which is the least wrong thing available, and confidence is what tells
+        the rest of the system not to trust it.
+        """
+        from src.tracking.features import _RAY_FALLBACK, _ray_features
+        from src.tracking.face_frame import HeadPlacement
+
+        values = _ray_features(None, None, HeadPlacement.invalid(), 1280, 720)
+        assert values == _RAY_FALLBACK
+        assert all(np.isfinite(v) for v in values.values())
 
     def test_the_ray_is_linear_in_screen_position(self):
         """A sphere gives sin(theta); a screen wants tan(theta)."""
@@ -769,16 +874,17 @@ class TestGazeRay:
             x, y = _gaze_ray(offset, offset)
             assert np.isfinite(x) and np.isfinite(y)
 
-    def test_both_frames_are_kept_because_the_radius_is_a_guess(self, simulator):
-        """The eyeball radius is a constant, and real eyes vary around it.
+    def test_the_shipped_set_keeps_a_non_geometric_fallback(self):
+        """The geometry can fail to solve; the image measurements cannot.
 
-        Rays alone degrade badly when the assumed radius is too small, because
-        the correction then bends the wrong way. Keeping the raw offsets
-        alongside gives the fit something unaffected to lean on.
+        ``plane_*`` needs a head pose, and a pose solve can be refused -- at
+        which point the ray features all read zero. The raw image offsets are
+        still there in that frame, so the fit has something to work from.
         """
         names = set(FEATURES)
-        assert {"ray_l_x", "ray_l_y"} <= names
-        assert {"iris_l_ix", "iris_l_iy"} <= names
+        assert {"plane_x", "plane_y"} <= names, "geometric ray missing"
+        assert {"iris_l_ix", "iris_l_iy"} <= names, "no fallback measurement"
+        assert {"ear_l", "ear_r"} <= names, "lid aperture missing"
 
 
 class TestRobustFit:
@@ -933,24 +1039,24 @@ class TestSpikeRejection:
 class TestCalibrationFiltering:
     def test_head_features_are_exempt_from_outlier_rejection(self):
         """Head movement during calibration is data, not noise."""
-        columns = gaze_feature_columns(FEATURES)
-        assert set(columns) == {0, 1, 2, 3, 4, 5, 6, 7}, \
-            "only the eye features are checked"
+        eye = gaze_feature_columns(FEATURES)
+        head = [FEATURES.index(n) for n in ("yaw", "pitch", "head_x", "head_z")]
+        assert not set(eye) & set(head), "head features are being outlier-checked"
 
         rng = np.random.default_rng(5)
         samples = np.zeros((30, len(FEATURES)))
-        samples[:, :8] = rng.normal(0, 0.01, (30, 8))     # steady eyes
-        samples[:, 9:13] = rng.normal(0, 0.5, (30, 4))    # head moving a lot
-        mask = robust_filter(samples, columns=columns)
+        samples[:, eye] = rng.normal(0, 0.01, (30, len(eye)))   # steady eyes
+        samples[:, head] = rng.normal(0, 0.5, (30, len(head)))  # head moving a lot
+        mask = robust_filter(samples, columns=eye)
         assert mask.sum() >= 28, "deliberate head movement was thrown away"
 
     def test_blink_frames_are_still_rejected(self):
-        columns = gaze_feature_columns(FEATURES)
+        eye = gaze_feature_columns(FEATURES)
         rng = np.random.default_rng(6)
         samples = np.zeros((30, len(FEATURES)))
-        samples[:, :8] = rng.normal(0, 0.01, (30, 8))
-        samples[7, :8] = [0.9, -0.8, 0.9, -0.8, 2.4, -2.1, 2.4, -2.1]  # a blink
-        mask = robust_filter(samples, columns=columns)
+        samples[:, eye] = rng.normal(0, 0.01, (30, len(eye)))
+        samples[7, eye] = rng.normal(0, 1.0, len(eye)) + 2.0   # a blink
+        mask = robust_filter(samples, columns=eye)
         assert not mask[7]
 
     def test_a_varied_calibration_keeps_most_samples(self, simulator):
@@ -990,7 +1096,9 @@ class TestCalibrationCoverage:
                 calibration_pattern("13point"), *SCREEN)):
             for _ in range(20):
                 head = HeadState().shifted(dx=rng.normal(0, 28), dz=rng.normal(0, 35),
-                                           droll=rng.normal(0, 8))
+                                           droll=rng.normal(0, 8),
+                                           dyaw=rng.normal(0, 9),
+                                           dpitch=rng.normal(0, 6))
                 session.add(point_id, target, simulator.features(target, head))
         coverage = session.coverage()
         assert set(coverage) <= set(COVERAGE_TARGETS)
@@ -1020,11 +1128,7 @@ class TestCalibrationDiagnosis:
             phase = rng.uniform(0.0, 6.0)
             for frame in range(int(seconds * FPS)):
                 moment = phase + frame / FPS
-                head = HeadState(
-                    x=34 * effort * math.sin(2 * math.pi * moment / 2.9),
-                    y=60 + 18 * effort * math.sin(2 * math.pi * moment / 3.7 + 1.0),
-                    z=600 + 55 * effort * math.sin(2 * math.pi * moment / 4.3 + 2.0),
-                    roll_deg=17 * effort * math.sin(2 * math.pi * moment / 2.0 + 0.3))
+                head = _roaming_head(moment, effort)
                 session.add(point_id, target, simulator.features(target, head))
         return session
 
@@ -1040,7 +1144,8 @@ class TestCalibrationDiagnosis:
                                  z=600 * (1 + 0.12 * wanted.lean),
                                  x=-47 * wanted.shift).shifted(
                     dx=rng.normal(0, 6 * drift), dy=rng.normal(0, 5 * drift),
-                    dz=rng.normal(0, 8 * drift), droll=rng.normal(0, 1.5 * drift))
+                    dz=rng.normal(0, 8 * drift), droll=rng.normal(0, 1.5 * drift),
+                    dyaw=rng.normal(0, 2.5 * drift), dpitch=rng.normal(0, 1.8 * drift))
                 session.add(point_id, target, simulator.features(target, head))
         return session
 
@@ -1161,36 +1266,99 @@ class TestCalibrationMethods:
         assert set(METHODS) == {"explore", "postures"}
 
 
+def _sweep(coverage, **axes):
+    """Sweep the named axes through their full range; default is all of them."""
+    for axis, limit in EXPLORE_RANGES.items():
+        if not axes.get(axis, True):
+            continue
+        for angle in np.linspace(-limit, limit, 40):
+            coverage.observe(**{f"{name}_deg": float(angle) if name == axis else 0.0
+                                for name in EXPLORE_RANGES})
+
+
 class TestPoseCoverage:
     def test_a_still_head_covers_one_bin(self):
         coverage = PoseCoverage()
         for _ in range(50):
-            coverage.observe(0.0)
-        assert coverage.fraction == pytest.approx(1 / coverage.bins)
+            coverage.observe(0.0, 0.0)
+        assert coverage.axis_fraction("tilt") == pytest.approx(1 / coverage.bins)
         assert not coverage.complete
 
-    def test_sweeping_the_range_completes_it(self):
+    def test_sweeping_every_axis_completes_it(self):
         coverage = PoseCoverage()
-        for roll in np.linspace(-EXPLORE_ROLL_RANGE, EXPLORE_ROLL_RANGE, 40):
-            coverage.observe(float(roll))
+        _sweep(coverage)
         assert coverage.complete
 
-    def test_tilts_beyond_the_range_are_ignored(self):
-        """Otherwise one wild movement would fill the ring and end the dot."""
+    def test_tilting_without_turning_does_not_complete_it(self):
+        """The fault this exists to prevent.
+
+        A single ring could be filled by rocking the head side to side and
+        never turning it, and a calibration that never saw the head turn cannot
+        correct for a turned head -- which is exactly what users reported:
+        tilting tracked, turning did not.
+        """
         coverage = PoseCoverage()
-        for roll in (90.0, -90.0, float("nan"), 1e6):
-            coverage.observe(roll)
+        _sweep(coverage, turn=False, nod=False)
+        assert coverage.axis_fraction("tilt") == 1.0
+        assert coverage.axis_fraction("turn") < 0.2
+        assert not coverage.complete
+
+    def test_progress_is_the_worst_axis_not_the_average(self):
+        coverage = PoseCoverage()
+        _sweep(coverage, turn=False, nod=False)
+        assert coverage.fraction == min(coverage.axis_fraction("turn"),
+                                        coverage.axis_fraction("nod"))
+
+    def test_angles_beyond_the_range_are_ignored(self):
+        """Otherwise one wild movement would fill a ring and end the dot."""
+        coverage = PoseCoverage()
+        for angle in (90.0, -90.0, float("nan"), 1e6):
+            coverage.observe(angle, angle, angle)
         assert coverage.fraction == 0.0
 
     def test_reset_clears_it_between_dots(self):
         coverage = PoseCoverage()
-        for roll in np.linspace(-EXPLORE_ROLL_RANGE, EXPLORE_ROLL_RANGE, 40):
-            coverage.observe(float(roll))
+        _sweep(coverage)
         coverage.reset()
         assert coverage.fraction == 0.0
 
 
 class TestFitReport:
+    def test_the_pose_holdout_is_harsher_than_the_target_holdout(self, estimator):
+        """Holding out targets says nothing about head pose.
+
+        A model that has quietly learned to read the target off the head still
+        predicts a held-out target correctly, because the poses it saw there
+        are in the training data for every other target. Holding out a *range*
+        of head positions is the figure that tracks what a user experiences
+        when they move, and it is always the larger of the two.
+        """
+        report = estimator.report
+        assert report.pose_error_px > 0, "no pose split was made"
+        assert report.pose_error_px > report.settled_error_px
+
+    def test_quality_is_rated_on_whichever_figure_is_worse(self):
+        """Being steady where you calibrated is not the same as being right."""
+        from src.tracking.gaze_estimator import FitReport
+        flattering = FitReport(mean_error_px=60.0, median_error_px=40.0,
+                               max_error_px=90.0, mean_error_normalised=60 / 2202,
+                               settled_error_px=40.0, pose_error_px=600.0)
+        assert flattering.quality() == "POOR"
+
+    def test_the_pose_holdout_is_skipped_when_there_is_nothing_to_split_on(self,
+                                                                          simulator):
+        """A rigidly still calibration has no range of poses to hold back.
+
+        Reported as zero rather than as a small number, because a small number
+        would read as "generalises well" when the truth is "never tested".
+        """
+        session = CalibrationSession(FEATURES, SCREEN, alphas=ALPHAS)
+        for point_id, target in enumerate(pattern_to_pixels(
+                calibration_pattern("13point"), *SCREEN)):
+            for _ in range(20):
+                session.add(point_id, target, simulator.features(target, HeadState()))
+        assert session.fit().report.pose_error_px == 0.0
+
     def test_frame_and_settled_errors_are_both_reported(self, estimator):
         report = estimator.report
         assert report.settled_error_px > 0

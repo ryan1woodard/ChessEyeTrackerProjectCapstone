@@ -19,7 +19,7 @@ import numpy as np
 from ..utils.geometry import clamp
 from .blink import BlinkDetector
 from .calibration import CalibrationProfile
-from .face_frame import fit_face_frame
+from .face_frame import fit_face_frame, solve_head_placement
 from .face_tracker import FaceTracker
 from .features import FeatureExtractor, FeatureVector
 from .gaze_estimator import GazeEstimator, GazeResult
@@ -283,8 +283,9 @@ class TrackingPipeline:
         # both want it, and two fits of the same landmarks would disagree by
         # nothing while costing twice as much.
         frame = fit_face_frame(landmarks)
+        placement = solve_head_placement(landmarks, frame)
         pose = self.head_pose_estimator.estimate(landmarks, frame)
-        features = self.feature_extractor.extract(landmarks, pose, frame)
+        features = self.feature_extractor.extract(landmarks, pose, frame, placement)
         return self.process_features(features, now, fps=fps, landmarks=landmarks)
 
     def process_features(self, features: FeatureVector, now: float,

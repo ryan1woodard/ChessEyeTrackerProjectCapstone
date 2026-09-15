@@ -170,6 +170,8 @@ POSTURES: List[Posture] = [
 COVERAGE_TARGETS: Dict[str, float] = {
     "eye_tilt": 0.70,
     "roll": 0.70,
+    "yaw": 0.55,
+    "pitch": 0.45,
     "head_x": 1.60,
     "head_z": 1.60,
 }
@@ -215,57 +217,97 @@ MAX_TARGET_CORRELATION = 0.45
 METHODS: Tuple[str, ...] = ("explore", "postures")
 DEFAULT_METHOD = "explore"
 
-#: Head tilt, in degrees either side of upright, that the explore method tries
-#: to see at every dot. Comfortable to reach without stretching.
-EXPLORE_ROLL_RANGE = 18.0
+#: How far the explore method asks the head to move on each axis, in degrees
+#: either side of neutral. Comfortable to reach without stretching.
+#:
+#: ``turn`` is here because its absence was the single largest fault in this
+#: tracker. The prompt used to ask for tilting, leaning and shifting and never
+#: for turning, and the coverage ring only ever measured tilt -- so calibration
+#: saw head roll and almost no head yaw, and the fitted model had no way to
+#: know what yaw does. That is exactly what users reported: tilting the head
+#: tracked fine, turning it did not.
+#:
+#: Measured in the simulator, error at 30 degrees of head turn, against how
+#: much turning the calibration was asked for:
+#:
+#:     asked for     +/-3 deg   +/-10 deg   +/-18 deg   +/-25 deg
+#:     error           207 px       94 px       52 px       35 px
+#:
+#: No modelling change came close to that. Twenty degrees is the working point:
+#: most of the benefit, and still a movement rather than a manoeuvre.
+#: ``nod`` earns its place the same way, on the vertical axis: with only a
+#: couple of degrees of it in the calibration, error at a pitched head is
+#: 38 px, against 23 px once the range is covered.
+EXPLORE_RANGES: Dict[str, float] = {"tilt": 18.0, "turn": 20.0, "nod": 12.0}
 
-#: How many bins that range is divided into for the coverage ring.
-EXPLORE_ROLL_BINS = 12
+#: How many bins each range is divided into for the coverage rings.
+EXPLORE_BINS = 12
 
-#: Fraction of the bins that counts as having covered the range. Not all of
-#: them: the extremes need a deliberate stretch, and the point of the ring is
-#: to keep the user moving, not to hold them at a dot until they hit every bin.
+#: Fraction of the bins on each axis that counts as having covered it. Not all
+#: of them: the extremes need a deliberate stretch, and the point of the rings
+#: is to keep the user moving, not to hold them at a dot until every bin is lit.
 EXPLORE_COVERAGE_TARGET = 0.75
 
 
 class PoseCoverage:
-    """Which head tilts have been seen while looking at the current dot.
+    """Which head positions have been seen while looking at the current dot.
 
     The explore method asks the user to keep moving, which is a vague
     instruction with no way of telling whether you have done enough of it.
-    Binning the tilts actually observed turns it into a concrete goal, and one
-    that can be drawn as a ring round the dot -- so it is answered without ever
+    Binning the poses actually observed turns it into a concrete goal, and one
+    that can be drawn as rings round the dot -- so it is answered without ever
     looking away from the dot to read anything.
+
+    Three axes -- tilt, turn and nod -- and all three must be covered. One ring
+    would let a user fill it by rocking their head side to side and never
+    turning it, which is the calibration this exists to prevent.
     """
 
-    def __init__(self, bins: int = EXPLORE_ROLL_BINS,
-                 roll_range: float = EXPLORE_ROLL_RANGE) -> None:
+    def __init__(self, bins: int = EXPLORE_BINS,
+                 ranges: Optional[Dict[str, float]] = None) -> None:
         self.bins = max(int(bins), 2)
-        self.roll_range = float(roll_range)
-        self.seen = [False] * self.bins
+        self.ranges = dict(ranges or EXPLORE_RANGES)
+        self.seen: Dict[str, List[bool]] = {
+            axis: [False] * self.bins for axis in self.ranges}
 
-    def bin_for(self, roll_deg: float) -> Optional[int]:
-        """Which bin a tilt falls in, or ``None`` if it is outside the range."""
-        if not np.isfinite(roll_deg) or abs(roll_deg) > self.roll_range:
+    def bin_for(self, axis: str, degrees: float) -> Optional[int]:
+        """Which bin an angle falls in, or ``None`` if it is outside the range."""
+        limit = self.ranges[axis]
+        if not np.isfinite(degrees) or abs(degrees) > limit:
             return None
-        position = (roll_deg + self.roll_range) / (2 * self.roll_range)
+        position = (degrees + limit) / (2 * limit)
         return min(int(position * self.bins), self.bins - 1)
 
-    def observe(self, roll_deg: float) -> None:
-        index = self.bin_for(roll_deg)
-        if index is not None:
-            self.seen[index] = True
+    def observe(self, tilt_deg: float, turn_deg: float = 0.0,
+                nod_deg: float = 0.0) -> None:
+        for axis, degrees in (("tilt", tilt_deg), ("turn", turn_deg),
+                              ("nod", nod_deg)):
+            if axis not in self.seen:
+                continue
+            index = self.bin_for(axis, degrees)
+            if index is not None:
+                self.seen[axis][index] = True
+
+    def axis_fraction(self, axis: str) -> float:
+        seen = self.seen.get(axis)
+        return sum(seen) / self.bins if seen else 0.0
 
     @property
     def fraction(self) -> float:
-        return sum(self.seen) / self.bins
+        """Overall progress: the *worst* axis, not the average.
+
+        Averaging would let a thoroughly covered tilt hide an untouched turn,
+        which is the failure this is here to catch.
+        """
+        return min((self.axis_fraction(a) for a in self.seen), default=0.0)
 
     @property
     def complete(self) -> bool:
         return self.fraction >= EXPLORE_COVERAGE_TARGET
 
     def reset(self) -> None:
-        self.seen = [False] * self.bins
+        for seen in self.seen.values():
+            seen[:] = [False] * self.bins
 
 
 def posture(point_index: int) -> Posture:
@@ -696,6 +738,8 @@ class CalibrationSession:
         )
 
         labels = {"eye_tilt": "head tilt", "roll": "head tilt",
+                  "yaw": "head turning, left and right",
+                  "pitch": "nodding, up and down",
                   "head_x": "side-to-side movement",
                   "head_z": "movement towards and away from the screen"}
         seen = set()

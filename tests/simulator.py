@@ -38,7 +38,7 @@ import numpy as np
 
 from src.tracking import face_tracker as fl
 from src.tracking.face_tracker import FaceLandmarks
-from src.tracking.face_frame import fit_face_frame
+from src.tracking.face_frame import fit_face_frame, solve_head_placement
 from src.tracking.features import FeatureExtractor, FeatureVector
 from src.tracking.head_pose import HeadPoseEstimator
 
@@ -119,6 +119,25 @@ LOWER_APERTURE_MM = 3.6
 #: does on a real eye.
 CLOSURE_OFFSET_MM = 1.1
 
+#: How far the lid margins follow the eye when it looks up or down, as a
+#: fraction of the eye's own vertical movement.
+#:
+#: The upper lid tracks the globe closely -- look down and it comes with you,
+#: look up and it retracts -- which is why it is nearly impossible to look down
+#: with your eyes wide open. The lower lid follows much less.
+UPPER_LID_FOLLOWS_GAZE = 0.55
+LOWER_LID_FOLLOWS_GAZE = 0.18
+
+#: How much of the apparent iris-centre shift caused by a lid cutting across
+#: the iris actually survives into the reported landmark.
+#:
+#: Not 1.0. MediaPipe fits a circle to the iris rather than taking the centroid
+#: of visible pixels, so it partly infers the hidden part and compensates --
+#: but only partly, and what is left is a bias that moves with vertical gaze.
+#: This is the mechanism behind the well-documented result that vertical gaze
+#: is measurably harder than horizontal for video-based trackers.
+IRIS_OCCLUSION_GAIN = 0.55
+
 
 def _eye_ring_offsets(ring: Sequence[int]) -> Dict[int, Tuple[float, float]]:
     """Map each eyelid landmark to ``(t, lid)`` along the eye.
@@ -149,6 +168,38 @@ _IRIS_IDS = {"left": fl.IRIS_LEFT, "right": fl.IRIS_RIGHT}
 #: Radius of the visible iris in millimetres, used to place the four rim
 #: landmarks MediaPipe reports around the pupil.
 IRIS_RADIUS_MM = 5.8
+
+
+def _occlusion_bias(centre_y: float, radius_px: float,
+                    upper_y: float, lower_y: float) -> float:
+    """How far a lid cutting across the iris shifts its apparent centre.
+
+    Computed by sampling the disc and taking the centroid of the part still
+    visible between the two lid margins. A closed form exists for one straight
+    cut, but not for two, and this is a simulator -- being obviously right
+    matters more here than being fast.
+
+    Returns the shift in pixels, positive downwards.
+    """
+    if radius_px <= 0.0:
+        return 0.0
+    steps = 21
+    offsets = np.linspace(-radius_px, radius_px, steps)
+    total_weight = 0.0
+    weighted_y = 0.0
+    for dy in offsets:
+        # Width of the disc at this height: the chord of the circle.
+        half_chord = math.sqrt(max(radius_px * radius_px - dy * dy, 0.0))
+        if half_chord <= 0.0:
+            continue
+        y = centre_y + dy
+        if y < upper_y or y > lower_y:
+            continue
+        total_weight += half_chord
+        weighted_y += half_chord * y
+    if total_weight <= 0.0:
+        return 0.0
+    return weighted_y / total_weight - centre_y
 
 
 def _lid_profile(t: float) -> float:
@@ -317,13 +368,15 @@ class EyeSimulator:
         rotation = head.rotation
         points = np.zeros((fl.REQUIRED_LANDMARKS, 3), dtype=np.float64)
 
-        def place(index: int, world_mm: np.ndarray) -> None:
-            pixel = self.project(world_mm)
+        def place_px(index: int, pixel: np.ndarray, depth_mm: float) -> None:
             if self.noise_px:
                 pixel = pixel + self.rng.normal(0.0, self.noise_px, 2)
             points[index, 0] = pixel[0] / self.frame_width
             points[index, 1] = pixel[1] / self.frame_height
-            points[index, 2] = world_mm[2] / 1000.0
+            points[index, 2] = depth_mm / 1000.0
+
+        def place(index: int, world_mm: np.ndarray) -> None:
+            place_px(index, self.project(world_mm), float(world_mm[2]))
 
         for index, local in self.face_mm.items():
             place(index, self._to_world(head, local))
@@ -332,11 +385,20 @@ class EyeSimulator:
         for side in ("left", "right"):
             corners = self.eye_corners_mm[side]
             outer, inner = corners["outer"], corners["inner"]
-            # Lid margins for this openness. Both travel towards the closure
-            # line, so the upper lid moves about four times as far as the lower
-            # one and a full closure leaves no gap at all.
-            upper = CLOSURE_OFFSET_MM + openness * (-UPPER_APERTURE_MM - CLOSURE_OFFSET_MM)
-            lower = CLOSURE_OFFSET_MM + openness * (LOWER_APERTURE_MM - CLOSURE_OFFSET_MM)
+            direction = self.gaze_direction(target_px, head, side)
+            centre_world = self.eye_centre_world(head, side)
+
+            # How far up or down the eye is looking, in its own head frame:
+            # what the lids follow.
+            local_gaze = head.rotation.T @ direction
+            gaze_drop_mm = EYEBALL_RADIUS_MM * float(local_gaze[1])
+
+            upper = (CLOSURE_OFFSET_MM
+                     + openness * (-UPPER_APERTURE_MM - CLOSURE_OFFSET_MM)
+                     + UPPER_LID_FOLLOWS_GAZE * gaze_drop_mm * openness)
+            lower = (CLOSURE_OFFSET_MM
+                     + openness * (LOWER_APERTURE_MM - CLOSURE_OFFSET_MM)
+                     + LOWER_LID_FOLLOWS_GAZE * gaze_drop_mm * openness)
             for landmark, (along, lid) in _RING_OFFSETS[side].items():
                 # Slide between the corners, then lift off the eye axis to the
                 # lid margin, tapering to nothing at both corners.
@@ -349,8 +411,6 @@ class EyeSimulator:
                 place(landmark, self._to_world(head, base + offset + bulge))
 
             # The iris rides on the eyeball surface, aimed at the target.
-            direction = self.gaze_direction(target_px, head, side)
-            centre_world = self.eye_centre_world(head, side)
             iris_world = centre_world + EYEBALL_RADIUS_MM * direction
             if blink_bias_mm:
                 iris_world = iris_world + rotation @ np.array([0.0, -blink_bias_mm, 0.0])
@@ -361,10 +421,24 @@ class EyeSimulator:
             right /= max(float(np.linalg.norm(right)), 1e-9)
             up = np.cross(direction, right)
 
+            iris_px = self.project(iris_world)
+            radius_px = 0.5 * float(np.linalg.norm(
+                self.project(iris_world + IRIS_RADIUS_MM * right)
+                - self.project(iris_world - IRIS_RADIUS_MM * right)))
+            upper_px = self.project(self._to_world(
+                head, np.array([0.0, upper, 0.0])
+                + outer + (inner - outer) * 0.5))[1]
+            lower_px = self.project(self._to_world(
+                head, np.array([0.0, lower, 0.0])
+                + outer + (inner - outer) * 0.5))[1]
+            bias = _occlusion_bias(iris_px[1], radius_px, upper_px, lower_px)
+
             ids = _IRIS_IDS[side]
-            place(ids[0], iris_world)
+            shift = np.array([0.0, bias * IRIS_OCCLUSION_GAIN])
+            place_px(ids[0], iris_px + shift, iris_world[2])
             for slot, offset_vector in enumerate((right, up, -right, -up), start=1):
-                place(ids[slot], iris_world + IRIS_RADIUS_MM * offset_vector)
+                rim = self.project(iris_world + IRIS_RADIUS_MM * offset_vector)
+                place_px(ids[slot], rim + shift, iris_world[2])
 
         return FaceLandmarks(points, self.frame_width, self.frame_height, has_iris=True)
 
@@ -391,8 +465,9 @@ class EyeSimulator:
         spoiled = FaceLandmarks(points, marks.frame_width, marks.frame_height,
                                 has_iris=True)
         frame = fit_face_frame(spoiled)
-        return self.extractor.extract(spoiled, self.pose_estimator.estimate(spoiled, frame),
-                                      frame)
+        placement = solve_head_placement(spoiled, frame)
+        return self.extractor.extract(
+            spoiled, self.pose_estimator.estimate(spoiled, frame), frame, placement)
 
     def features(self, target_px: Tuple[float, float],
                  head: Optional[HeadState] = None,
@@ -400,8 +475,9 @@ class EyeSimulator:
         """Render a frame and run it through the real extraction chain."""
         marks = self.landmarks(target_px, head, blink_bias_mm)
         frame = fit_face_frame(marks)
+        placement = solve_head_placement(marks, frame)
         pose = self.pose_estimator.estimate(marks, frame)
-        return self.extractor.extract(marks, pose, frame)
+        return self.extractor.extract(marks, pose, frame, placement)
 
     def blink_features(self, target_px: Tuple[float, float],
                        head: Optional[HeadState] = None,

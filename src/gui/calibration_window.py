@@ -134,6 +134,8 @@ class CalibrationWindow(QWidget):
         #: Most recent measured head tilt, for the live gauge. ``None`` until a
         #: face has been seen, which is itself worth showing.
         self._head_roll: Optional[float] = None
+        self._head_yaw: Optional[float] = None
+        self._head_pitch: Optional[float] = None
         #: Lateral offset and distance, in the metric units the feature
         #: extractor produces, and the user's own resting values for them.
         #: Without a baseline "lean in" has no measurable target; with one it
@@ -198,8 +200,10 @@ class CalibrationWindow(QWidget):
     def on_sample(self, sample: GazeSample) -> None:
         """Slot for ``TrackerWorker.sample_ready`` (queued to the GUI thread)."""
         self._face_present = sample.face_detected
-        self._head_roll = (sample.head_pose.roll
-                           if sample.face_detected and sample.head_pose.valid else None)
+        usable_pose = sample.face_detected and sample.head_pose.valid
+        self._head_roll = sample.head_pose.roll if usable_pose else None
+        self._head_yaw = sample.head_pose.yaw if usable_pose else None
+        self._head_pitch = sample.head_pose.pitch if usable_pose else None
         features = sample.features
         if features is not None and features.valid:
             self._head_x = features.get("head_x")
@@ -212,7 +216,8 @@ class CalibrationWindow(QWidget):
         else:
             self._head_x = self._head_z = None
         if self._phase == PHASE_COLLECT and self.exploring and self._head_roll is not None:
-            self._coverage.observe(self._head_roll)
+            self._coverage.observe(self._head_roll, self._head_yaw or 0.0,
+                                   self._head_pitch or 0.0)
         if self._phase != PHASE_COLLECT or sample.features is None:
             return
         if not self.exploring and self._collected >= self._quota:
@@ -452,13 +457,15 @@ class CalibrationWindow(QWidget):
         if self.exploring:
             return (
                 "Look straight at each dot and keep looking at it.\n\n"
-                "While you look, keep your head moving: roll it slowly from\n"
-                "side to side, lean in and back, shift a little left and right.\n"
-                "Do not try to hold still, and do not try to hit any particular\n"
-                "position -- just keep moving, gently, the whole time.\n\n"
-                "A ring around each dot fills in as your head covers new\n"
-                "angles. When it is full the dot moves on. You never need to\n"
-                "look away from the dot to check it.\n\n"
+                "While you look, keep your head moving, three ways:\n\n"
+                "   TILT it side to side, ear towards shoulder\n"
+                "   TURN it left and right, as if glancing at someone beside you\n"
+                "   NOD it up and down\n\n"
+                "Lean in and back too. Your eyes stay on the dot throughout.\n\n"
+                "Three rings around each dot fill in as you go, one per\n"
+                "movement, innermost first. All three must fill before the dot\n"
+                "moves on, so if one is stuck, that is the movement to do more\n"
+                "of. You never need to look away to check them.\n\n"
                 "This is what teaches the tracker to tell head movement apart\n"
                 "from eye movement. If your head sits in the same place at\n"
                 "every dot, the two look identical to it, and tracking falls\n"
@@ -688,31 +695,36 @@ class CalibrationWindow(QWidget):
         painter.setFont(QFont("Segoe UI", 15, QFont.DemiBold))
         message = ("Face not detected - check your lighting and camera"
                    if not self._face_present else
-                   "Eyes on the dot - now roll your head slowly side to side, "
-                   "and lean in and back")
+                   "Eyes on the dot - tilt your head side to side, turn it "
+                   "left and right, nod it up and down")
         painter.drawText(QRectF(0, self.height() - 108, self.width(), 30),
                          Qt.AlignCenter, message)
 
     def _paint_coverage_ring(self, painter: QPainter, centre: QPointF,
                              radius: float) -> None:
-        """The head tilts seen so far at this dot, as segments round the dot.
+        """The head poses seen so far at this dot, as rings round the dot.
 
         Drawn concentric with the target on purpose. The user has to keep
         looking at the dot, so anything they need to check has to be readable
         without moving their eyes -- a ring around the thing they are already
         staring at is the only place that is true of.
+
+        One ring per axis -- tilt, turn, nod, innermost outwards -- because a
+        single ring could be filled by rocking the head side to side without
+        ever turning it, and a calibration that never saw the head turn cannot
+        correct for a turned head.
         """
         bins = self._coverage.bins
         gap = 360.0 / bins * 0.22
         span = 360.0 / bins - gap
-        box = QRectF(centre.x() - radius, centre.y() - radius, radius * 2, radius * 2)
-        for index, seen in enumerate(self._coverage.seen):
-            # Bin 0 is the largest leftward tilt; lay them out so rolling the
-            # head one way lights the ring that way round.
-            start = 180.0 - (index + 0.5) * (360.0 / bins) - span / 2
-            painter.setPen(QPen(_GOOD if seen else QColor(64, 72, 86),
-                                5 if seen else 3, Qt.SolidLine, Qt.RoundCap))
-            painter.drawArc(box, int(start * 16), int(span * 16))
+        for depth, axis in enumerate(("tilt", "turn", "nod")):
+            ring = radius * (1.0 + 0.28 * depth)
+            box = QRectF(centre.x() - ring, centre.y() - ring, ring * 2, ring * 2)
+            for index, seen in enumerate(self._coverage.seen[axis]):
+                start = 180.0 - (index + 0.5) * (360.0 / bins) - span / 2
+                painter.setPen(QPen(_GOOD if seen else QColor(64, 72, 86),
+                                    5 if seen else 3, Qt.SolidLine, Qt.RoundCap))
+                painter.drawArc(box, int(start * 16), int(span * 16))
 
     def _paint_posture_reminder(self, painter: QPainter) -> None:
         """A compact reminder beside the dot, once the dot is what matters.

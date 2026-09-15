@@ -447,17 +447,32 @@ class MainWindow(QMainWindow):
         quality = report.quality(good, fair) if report else "UNKNOWN"
 
         if report:
-            message = (
-                f"Holding your gaze steady: {report.settled_error_px:.0f} px\n"
-                f"Any single frame:         {report.mean_error_px:.0f} px\n"
-                f"Worst calibration point:  {report.max_error_px:.0f} px\n\n"
-                f"Quality: {quality}\n\n"
-                "The first figure is what you will notice: it is the error once\n"
-                "smoothing has settled on a square you are looking at. The second\n"
-                "is one unsmoothed frame, which is noisier by nature.\n\n"
-                "Both come from leave-one-point-out cross-validation, so they\n"
-                "estimate accuracy at screen positions that were not calibrated.\n"
-                "Webcam gaze tracking is an estimate, not a measurement."
+            lines = [
+                f"Holding your gaze steady:   {report.settled_error_px:.0f} px",
+                f"Any single frame:           {report.mean_error_px:.0f} px",
+            ]
+            if report.pose_error_px > 0:
+                lines.append(
+                    f"At head positions unseen:   {report.pose_error_px:.0f} px")
+            lines.append(
+                f"Worst calibration point:    {report.max_error_px:.0f} px")
+            message = "\n".join(lines) + (
+                f"\n\nQuality: {quality}\n\n"
+                "The first figure is what you will notice: the error once\n"
+                "smoothing has settled on a square you are looking at. The\n"
+                "second is one unsmoothed frame, which is noisier by nature.\n"
+            )
+            if report.pose_error_px > 0:
+                message += (
+                    "The third is the one that matters when you move: it holds\n"
+                    "back a whole range of head positions and measures how the\n"
+                    "tracker does at positions it never saw.\n"
+                )
+            message += (
+                "\nThese come from cross-validation, so they estimate accuracy\n"
+                "in situations the model was not fitted on. Webcam gaze\n"
+                "tracking is an estimate, not a measurement.\n\n"
+                f"Collected {report.n_samples} samples over {report.n_points} points."
             )
             if profile.coverage_warnings:
                 message += "\n\nWhat went wrong:\n\n"
@@ -473,10 +488,17 @@ class MainWindow(QMainWindow):
             if not profile.coverage_warnings:
                 # Nothing specific was detectable, so say what usually helps
                 # rather than leaving the user with a verdict and no next step.
-                advice += ("\n\nWhat usually helps, in order: more light on your face "
-                           "from the front; the webcam at the top centre of the screen; "
-                           "sitting 50-70 cm away; and keeping your head moving at every "
-                           "dot rather than holding still.")
+                advice += (
+                    "\n\nNothing specific was detectable in the collection, so the "
+                    "usual causes, in order:\n\n"
+                    "- Light on your face from the front. A window or lamp behind you "
+                    "is the single most common cause.\n"
+                    "- Webcam at the top centre of the screen, not off to one side.\n"
+                    "- 50-70 cm away, with your whole face in frame even when you look "
+                    "at the corners of the screen.\n"
+                    "- Glasses catching a reflection; tilting them slightly can help.\n"
+                    "- Keep your head moving at every dot, all three ways the "
+                    "instructions ask for.")
             box.setText(message + advice)
             again = box.addButton("Calibrate Again", QMessageBox.AcceptRole)
             box.addButton("Use Anyway", QMessageBox.RejectRole)

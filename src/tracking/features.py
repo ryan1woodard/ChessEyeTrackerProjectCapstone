@@ -62,7 +62,9 @@ from typing import Dict, List, Optional, Sequence
 import numpy as np
 
 from . import face_tracker as fl
-from .face_frame import FaceFrame, fit_face_frame
+from .face_frame import (FaceFrame, HeadPlacement, camera_matrix,
+                         fit_face_frame, solve_head_placement)
+from .gaze_ray import both_eyes, centre_response, kappa_response
 from .face_tracker import FaceLandmarks
 from .head_pose import HeadPose
 
@@ -80,6 +82,17 @@ FEATURE_NAMES: tuple[str, ...] = (
     "ray_l_x", "ray_l_y",
     "ray_r_x", "ray_r_y",
     "ray_mean_x", "ray_mean_y",
+    # The 3-D gaze ray: head rotation applied geometrically rather than left
+    # for the regression to approximate. See gaze_ray.
+    "gaze_hx", "gaze_hy",
+    "plane_l_x", "plane_r_x",
+    "plane_x", "plane_y",
+    # How the screen hit moves per radian of kappa, which makes the unknown
+    # per-user kappa a linear coefficient the ridge fit solves for.
+    "kappa_xx", "kappa_xy", "kappa_yx", "kappa_yy",
+    # And per millimetre of error in where the eyeball centre is taken to be,
+    # which with an 11 mm lever arm is the largest term of all.
+    "centre_xx", "centre_xy", "centre_yx", "centre_yy", "centre_zx", "centre_zy",
     "iris_vergence",
     "yaw", "pitch", "roll",
     "eye_tilt",
@@ -147,6 +160,14 @@ NOMINAL_SCALES: Dict[str, float] = {
     "ray_l_x": 0.50, "ray_l_y": 0.40,
     "ray_r_x": 0.50, "ray_r_y": 0.40,
     "ray_mean_x": 0.50, "ray_mean_y": 0.40,
+    "gaze_hx": 0.50, "gaze_hy": 0.40,
+    "plane_l_x": 0.60, "plane_r_x": 0.60,
+    "plane_x": 0.60, "plane_y": 0.40,
+    "kappa_xx": 0.50, "kappa_xy": 0.50,
+    "kappa_yx": 0.50, "kappa_yy": 0.50,
+    "centre_xx": 0.10, "centre_xy": 0.10,
+    "centre_yx": 0.10, "centre_yy": 0.10,
+    "centre_zx": 0.10, "centre_zy": 0.10,
     "iris_vergence": 0.10,
     "yaw": 0.45, "pitch": 0.45, "roll": 0.45,
     "eye_tilt": 0.45,
@@ -304,6 +325,81 @@ def _mean_angle_deg(*angles: float) -> float:
     return float(np.degrees(np.arctan2(np.sin(radians).mean(), np.cos(radians).mean())))
 
 
+#: What the ray features read when the geometry could not be solved -- no face
+#: pose, or a ray that misses the screen plane entirely.
+#:
+#: Zero, and zero is a real value here rather than a marker: it means "looking
+#: at the middle of the screen", which is the least wrong guess available and
+#: keeps the polynomial in the range it was fitted over. A sentinel like NaN
+#: would propagate through every product term in the expansion and invalidate
+#: the frame; a large number would be extrapolation. The confidence score is
+#: what tells the rest of the system not to trust the frame.
+_RAY_FALLBACK: Dict[str, float] = {
+    "gaze_hx": 0.0, "gaze_hy": 0.0,
+    "plane_l_x": 0.0, "plane_r_x": 0.0,
+    "plane_x": 0.0, "plane_y": 0.0,
+    "kappa_xx": 0.0, "kappa_xy": 0.0,
+    "kappa_yx": 0.0, "kappa_yy": 0.0,
+    "centre_xx": 0.0, "centre_xy": 0.0, "centre_yx": 0.0,
+    "centre_yy": 0.0, "centre_zx": 0.0, "centre_zy": 0.0,
+}
+
+
+def _ray_features(left: EyeFeatures, right: EyeFeatures,
+                  placement: HeadPlacement,
+                  frame_width: int, frame_height: int) -> Dict[str, float]:
+    """Gaze-ray features, or neutral values when the geometry does not solve."""
+    if not placement.valid:
+        return dict(_RAY_FALLBACK)
+    left_ray, right_ray = both_eyes(left.iris_center_px, right.iris_center_px,
+                                    placement, frame_width, frame_height)
+    if not (left_ray.valid and right_ray.valid):
+        return dict(_RAY_FALLBACK)
+
+    values = {
+        # Eye-in-head: what the eye muscles do, with the head taken out of it.
+        # This is the quantity the gaze-estimation literature normalises to,
+        # and it is stable across head poses in a way an image offset is not.
+        "gaze_hx": 0.5 * (left_ray.head_yaw + right_ray.head_yaw),
+        "gaze_hy": 0.5 * (left_ray.head_pitch + right_ray.head_pitch),
+    }
+    hits = [r.plane_hit for r in (left_ray, right_ray)]
+    if any(hit is None for hit in hits):
+        values.update({k: v for k, v in _RAY_FALLBACK.items() if k not in values})
+        return values
+    left_hit, right_hit = hits
+    values["plane_l_x"] = float(left_hit[0])
+    values["plane_r_x"] = float(right_hit[0])
+    values["plane_x"] = 0.5 * float(left_hit[0] + right_hit[0])
+    values["plane_y"] = 0.5 * float(left_hit[1] + right_hit[1])
+
+    responses = [kappa_response(r, placement) for r in (left_ray, right_ray)]
+    if any(response is None for response in responses):
+        values.update({k: _RAY_FALLBACK[k] for k in
+                       ("kappa_xx", "kappa_xy", "kappa_yx", "kappa_yy")})
+        return values
+    about_x = 0.5 * (responses[0][0] + responses[1][0])
+    about_y = 0.5 * (responses[0][1] + responses[1][1])
+    values["kappa_xx"], values["kappa_xy"] = float(about_x[0]), float(about_x[1])
+    values["kappa_yx"], values["kappa_yy"] = float(about_y[0]), float(about_y[1])
+
+    camera = camera_matrix(frame_width, frame_height)
+    centres = [
+        centre_response(eye.iris_center_px, side, placement, camera, ray.plane_hit)
+        for eye, side, ray in ((left, "left", left_ray), (right, "right", right_ray))
+    ]
+    if any(response is None for response in centres):
+        values.update({k: _RAY_FALLBACK[k] for k in
+                       ("centre_xx", "centre_xy", "centre_yx",
+                        "centre_yy", "centre_zx", "centre_zy")})
+        return values
+    for axis, name in enumerate("xyz"):
+        mean = 0.5 * (centres[0][axis] + centres[1][axis])
+        values[f"centre_{name}x"] = float(mean[0])
+        values[f"centre_{name}y"] = float(mean[1])
+    return values
+
+
 class FeatureExtractor:
     """Turns raw landmarks plus head pose into a :class:`FeatureVector`."""
 
@@ -312,7 +408,8 @@ class FeatureExtractor:
 
     def extract(self, landmarks: Optional[FaceLandmarks],
                 head_pose: Optional[HeadPose],
-                frame: Optional[FaceFrame] = None) -> FeatureVector:
+                frame: Optional[FaceFrame] = None,
+                placement: Optional[HeadPlacement] = None) -> FeatureVector:
         if landmarks is None or not landmarks.has_iris:
             return FeatureVector.invalid()
 
@@ -392,4 +489,9 @@ class FeatureExtractor:
             "ear_l": left.openness,
             "ear_r": right.openness,
         }
-        return FeatureVector(values=values, valid=True, left=left, right=right, head_pose=pose)
+        if placement is None:
+            placement = solve_head_placement(landmarks, frame)
+        values.update(_ray_features(left, right, placement,
+                                    landmarks.frame_width, landmarks.frame_height))
+        return FeatureVector(values=values, valid=True, left=left, right=right,
+                             head_pose=pose)

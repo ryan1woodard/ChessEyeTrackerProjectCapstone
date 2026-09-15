@@ -43,7 +43,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from ..utils.geometry import clamp
-from .features import FeatureVector, nominal_scales
+from .features import NOMINAL_SCALES, FeatureVector, nominal_scales
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +187,16 @@ class FitReport:
     #: target: the accuracy of a steady fixation once smoothing has settled.
     #: ``mean_error_px`` is the harsher single-frame figure.
     settled_error_px: float = 0.0
+    #: Error at head positions the model was never fitted on.
+    #:
+    #: The other two figures hold out screen *targets*, which says nothing
+    #: about head pose: a model that has quietly learned to read the target off
+    #: the head still predicts a held-out target correctly, because the poses
+    #: it saw at that target are in the training data for every other one. This
+    #: holds out a *range of head poses* instead, and is the figure that tracks
+    #: what the user experiences when they move. Zero when there was too little
+    #: pose variation to split on -- which the coverage warnings cover instead.
+    pose_error_px: float = 0.0
     train_mean_error_px: float = 0.0
     alpha: float = 0.0
     n_samples: int = 0
@@ -208,7 +218,12 @@ class FitReport:
         # their gaze on a square experiences; the single-frame figure is
         # reported alongside it but is dominated by landmark noise the
         # smoothing filter removes.
+        # Rated on whichever honest figure is worse. A model can be steady at
+        # the pose it was calibrated in and fall apart a head-turn away, and
+        # rating it on the first number alone would call that GOOD.
         score = self.settled_error_px or self.mean_error_px
+        if self.pose_error_px > 0:
+            score = max(score, self.pose_error_px)
         if score <= good:
             return "GOOD"
         if score <= fair:
@@ -230,6 +245,7 @@ class FitReport:
             "mean_error_normalised": self.mean_error_normalised,
             "per_point_error_px": list(self.per_point_error_px),
             "settled_error_px": self.settled_error_px,
+            "pose_error_px": self.pose_error_px,
             "train_mean_error_px": self.train_mean_error_px,
             "alpha": self.alpha,
             "n_samples": self.n_samples,
@@ -245,6 +261,7 @@ class FitReport:
             mean_error_normalised=float(data.get("mean_error_normalised", 0.0)),
             per_point_error_px=list(data.get("per_point_error_px", [])),
             settled_error_px=float(data.get("settled_error_px", 0.0)),
+            pose_error_px=float(data.get("pose_error_px", 0.0)),
             train_mean_error_px=float(data.get("train_mean_error_px", 0.0)),
             alpha=float(data.get("alpha", 0.0)),
             n_samples=int(data.get("n_samples", 0)),
@@ -385,6 +402,53 @@ class RidgeGazeEstimator(GazeEstimator):
         half = np.maximum(0.5 * (high - low), floor)
         return centre - half, centre + half
 
+    #: Head-pose features to split on for the pose holdout, best first.
+    _POSE_SPLIT_FEATURES = ("yaw", "eye_tilt", "roll", "pitch", "head_x", "head_z")
+
+    #: How many pose groups to split into. Four leaves each fold with three
+    #: quarters of the poses to learn from, which is enough to fit, while the
+    #: held-out quarter is genuinely outside what it saw.
+    POSE_FOLDS = 4
+
+    #: Below this spread, there were not enough distinct head poses to split
+    #: on and the holdout is not reported at all. Measured in the standardised
+    #: feature units the design matrix uses.
+    MIN_POSE_SPREAD = 0.25
+
+    @classmethod
+    def _pose_holdout_error(cls, design: np.ndarray, targets: np.ndarray,
+                            feature_names: Sequence[str], raw: np.ndarray,
+                            alpha: float) -> float:
+        """Error at head poses the model never saw, or 0.0 if unmeasurable.
+
+        Samples are sorted by whichever pose feature varied most and split into
+        contiguous blocks, so a held-out block is a *range* of head positions
+        rather than a scatter of them -- holding out every fourth frame would
+        leave near-identical poses in the training set and measure nothing.
+        """
+        names = [n for n in cls._POSE_SPLIT_FEATURES if n in feature_names]
+        if not names or raw.shape[0] < cls.POSE_FOLDS * 4:
+            return 0.0
+
+        spreads = {n: float(np.std(raw[:, list(feature_names).index(n)]))
+                   / max(NOMINAL_SCALES.get(n, 1.0), 1e-9) for n in names}
+        axis, spread = max(spreads.items(), key=lambda item: item[1])
+        if spread < cls.MIN_POSE_SPREAD:
+            return 0.0
+
+        order = np.argsort(raw[:, list(feature_names).index(axis)])
+        folds = np.array_split(order, cls.POSE_FOLDS)
+        errors: List[float] = []
+        for fold in folds:
+            held = np.zeros(raw.shape[0], dtype=bool)
+            held[fold] = True
+            if held.all() or not held.any():
+                continue
+            weights = robust_ridge_fit(design[~held], targets[~held], alpha)
+            predicted = design[held] @ weights
+            errors.extend(np.hypot(*(predicted - targets[held]).T).tolist())
+        return float(np.mean(errors)) if errors else 0.0
+
     @classmethod
     def fit(
         cls,
@@ -489,6 +553,9 @@ class RidgeGazeEstimator(GazeEstimator):
                 best = score
                 break
 
+        pose_error = cls._pose_holdout_error(design, targets, feature_names,
+                                             raw_features, best.alpha)
+
         input_low, input_high = cls.input_range(raw_features, feature_names)
 
         weights = robust_ridge_fit(design, targets, best.alpha)
@@ -504,6 +571,7 @@ class RidgeGazeEstimator(GazeEstimator):
             mean_error_normalised=best.frame_error / diagonal if diagonal else 0.0,
             per_point_error_px=[float(e) for e in point_errors],
             settled_error_px=float(np.mean(point_errors)) if point_errors else 0.0,
+            pose_error_px=pose_error,
             train_mean_error_px=train_error,
             alpha=float(best.alpha),
             n_samples=int(raw_features.shape[0]),
@@ -511,9 +579,11 @@ class RidgeGazeEstimator(GazeEstimator):
         )
         logger.info(
             "Calibration fitted: %d points / %d samples, alpha=%.4g, "
-            "LOPO frame error=%.1f px, settled %.1f px (train %.1f px)",
+            "LOPO frame error=%.1f px, settled %.1f px, unseen head poses %.1f px "
+            "(train %.1f px)",
             report.n_points, report.n_samples, report.alpha,
-            report.mean_error_px, report.settled_error_px, report.train_mean_error_px,
+            report.mean_error_px, report.settled_error_px, report.pose_error_px,
+            report.train_mean_error_px,
         )
         return cls(feature_names, degree, mean, scale, weights,
                    screen_size, screen_origin, report,
