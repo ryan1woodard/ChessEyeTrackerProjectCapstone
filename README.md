@@ -41,9 +41,10 @@ Read this before you draw conclusions from the numbers.
   angle in good conditions, which on a typical monitor is 50-150 pixels. On a
   600 px chessboard the squares are 75 px, so individual squares are at the
   edge of what is resolvable. Neighbouring-square confusion is normal.
-- Accuracy degrades as soon as you move. Calibration ties the model to one head
-  position, one seating distance and one monitor. Shift your chair and you
-  should recalibrate.
+- Accuracy still degrades once you move well outside the postures calibration
+  observed. The calibration prompts cover a range of head tilts, distances and
+  offsets, but it is tied to one seating position and one monitor. Move to a
+  noticeably different posture and you should recalibrate.
 - Glasses, strong backlighting, dim rooms and off-axis webcams all reduce
   accuracy, sometimes drastically.
 - Board detection is a convenience, not a guarantee. Unusual themes, heavy
@@ -120,36 +121,72 @@ python app.py --monitor 2     # track the second monitor
 
 ### 1. Calibrate
 
-Press **Start Tracking**, then **Calibrate**. A full-screen window shows 13
-targets one at a time. Look directly at each dot until its green ring fills.
+Press **Start Tracking**, then **Calibrate**. There are two ways to do it, and
+`M` on the intro screen switches between them (it is in Settings too).
 
-**Let your head move gently while you do this.** Keep your eyes locked on the
-dot, but drift your head a little -- left and right, nearer and further. This
-is counter-intuitive and it matters more than anything else in this document.
+#### Move your head (the default)
 
-A calibration recorded with the head clamped still teaches the tracker nothing
-about how head movement and eye movement trade off, so the moment you shift in
-your chair the estimate degrades badly. Measured against the simulator, an 8
-degree head turn costs **313 px** of error after a still-head calibration and
-**39 px** after a head-varied one. Sit at your normal playing distance.
+Look straight at each dot and **keep looking at it**, while your head keeps
+moving: roll it slowly side to side, lean in and back, shift a little left and
+right. Do not try to hold still, and do not try to hit any particular position.
+Just keep moving, gently, the whole time.
+
+A ring around each dot fills in as your head covers new angles, and the dot
+moves on when it is full -- so the feedback is on the dot you are already
+staring at, and you never look away to check it. About a minute in total.
+
+#### Hold a posture (quicker)
+
+Each point first asks you to sit a certain way, with a gauge showing when you
+have it, and then shows the dot. **Stay relaxed while you hold it** and let your
+head drift; holding rigidly still is what makes this method fragile. About 55
+seconds.
+
+#### Why any of this
+
+The tracker has to tell head movement apart from eye movement, and it can only
+learn that from seeing both at the same dot. If your head is in the same place
+every time you look at a given dot, the two are indistinguishable -- the model
+will happily read the dot off your head position, which works perfectly during
+calibration and falls apart the first time you move during a game.
+
+Measured in the simulator, the same 13 points collected four ways:
+
+| how the head was held | error |
+|---|---|
+| roaming at every dot | 25 px |
+| posture held, still drifting | 23 px |
+| posture held rigidly still | 42 px |
+| barely moving at all | 66 px |
+
+Moving your head is not a courtesy to the software. It is the measurement.
 
 Press `R` during a target to redo it, or `Esc` to cancel.
 
 At the end you get a report:
 
 ```
-Average error: 74 px
-Median error:  61 px
-Worst error:   183 px
+Holding your gaze steady: 38 px
+Any single frame:         61 px
+Worst calibration point:  96 px
 
 Quality: GOOD
 ```
 
-These figures come from **leave-one-point-out cross-validation**: for each
-calibration target the model is refitted without it and then asked to predict
-it. That means the error you are shown estimates accuracy at screen positions
-the model has never seen, which is what you actually care about. A training-set
-error would look far better and mean nothing.
+The first figure is the one you will notice: the error once smoothing has
+settled on a square you are looking at. The second is a single unsmoothed
+frame, which is noisier by nature. Both come from **leave-one-point-out
+cross-validation**: for each calibration target the model is refitted without
+it and then asked to predict it, so the error estimates accuracy at screen
+positions the model has never seen. A training-set error would look far better
+and mean nothing.
+
+If anything was wrong with the collection, the report says what rather than
+just rating it. It checks how much your head moved **at each individual dot**
+(not pooled over the whole run, which cannot tell a good calibration from one
+that held a different fixed posture at every dot), how many dots and samples
+survived, and whether your head position gave away which dot you were looking
+at. Each of those is something you can act on.
 
 If quality comes back POOR you are offered **Calibrate Again** or **Use
 Anyway**.
@@ -280,6 +317,10 @@ Heatmaps are reconstructed from stored gaze coordinates, not from saved images.
 | Accuracy decays as you shift position | Recalibrate, letting your head drift gently during each dot. Use Quick Recentre for a steady offset. |
 | Dot jumps around while you stare | Set Smoothing to High in Settings. If it persists, improve lighting: noisy landmarks are the root cause. |
 | A blink knocks the estimate off | Should no longer happen; raise "Hold estimate after a blink" in Settings if it does. |
+| The dot jumps for a moment, then comes back | A frame or two of bad landmarks, usually a reflection off glasses. The median prefilter absorbs bursts of up to two frames; raise the smoothing preset if it persists. |
+| The dot drifts off as soon as you tilt your head | Recalibrate and follow the posture prompts above each dot; a calibration that never saw tilt cannot correct for it. |
+| Nothing tracks at all, but your face is detected | Usually narrow or hooded eyes read as permanently closed. The closed-eye threshold now adapts to you over the first half-second; if it persists, lower "blink_ear_threshold" in the config. |
+| The dot lags behind for a second after you look back at the screen | Fixed in this version; the filters are dropped after a gap in tracking rather than blended across it. |
 | "module 'mediapipe' has no attribute 'solutions'" | MediaPipe 0.10.30+ removed that API. Run `pip install -r requirements.txt --upgrade`, or let the app download the Tasks model on first run. |
 | Camera preview stays "off" | The tracking worker failed to start; the real error is in the status bar and `logs/eye_tracker.log`. The preview only shows frames while the worker is alive. |
 | "No webcam detected" | Connect a webcam and restart. Check no other app holds it. |
@@ -366,28 +407,131 @@ error of the best is chosen. With only 13 points the minimum is noisy, and the
 simpler model extrapolates far better outside the calibrated region -- which is
 where a gaze tracker spends most of its time.
 
-**Calibration deliberately samples head movement.** Because the camera sees eye
-rotation relative to the *head*, head rotation and eye rotation trade off
-against each other: the same iris offset points at different screen positions
-depending on where the head is. A calibration recorded at one fixed head pose
-contains no information about that trade-off, so it cannot compensate for it.
-Sampling a range of head positions during calibration is what makes the tracker
-survive the user shifting in their chair.
+**Calibration has to decorrelate head position from screen position.** Because
+the camera sees eye rotation relative to the *head*, head rotation and eye
+rotation trade off against each other: the same iris offset points at different
+screen positions depending on where the head is. A calibration recorded at one
+fixed pose contains no information about that trade-off, and predictions
+outside the range it observed are clamped to the edge of that range.
+
+Worse than containing no information is containing misleading information. If
+the head sits in a characteristic place for each dot, head position *predicts*
+which dot is being looked at, and the fit will use it -- scoring beautifully on
+its own data and collapsing the moment the user moves. An earlier version of
+this asked for one held posture per dot and did exactly that: measured against
+the simulator it cost 42 px against 23 px for the same postures held less
+rigidly, and the correlation between head features and target position was 0.33
+against 0.06 for a calibration where the head roams at every dot.
+
+The default method therefore asks the user to keep moving at every dot rather
+than to adopt a pose, which unties the two by construction and is also a much
+easier instruction to follow correctly. The posture method remains for people
+who want it faster.
+
+**Coverage is checked per dot, not pooled.** The distinction is the whole value
+of the check. A run that holds a different fixed posture at each dot shows
+plenty of head movement overall while being one of the worst arrangements
+there is. Measured per dot, it does not:
+
+| how the head was held | error | per-dot span | pooled span |
+|---|---|---|---|
+| roaming at every dot | 25 px | 1.22 | 1.28 |
+| posture held, still drifting | 23 px | 0.88 | 2.21 |
+| posture held rigidly | 42 px | 0.23 | 1.55 |
+| barely moving at all | 66 px | 0.38 | 0.42 |
+
+The per-dot column orders with the error. The pooled one rates the 42 px case
+above the 25 px one.
+
+**The report says what went wrong, not just how bad it was.** "POOR" on its own
+is not something a user can act on. The fit reports per-dot coverage on each
+axis, how many dots and samples survived, and the strongest correlation between
+a head feature and target position -- each of which maps to a specific thing to
+do differently. This matters more than it sounds: a calibration where the user
+barely moved reports a *low* cross-validated error, because every held-out dot
+was recorded in the same narrow range as the rest, and looks excellent while
+being three times worse in use.
+
+**The regularisation is chosen against single frames, not their average.**
+Leave-one-point-out cross-validation used to score the *mean* of the held-out
+frames at each target. That measures only the model's bias there and cancels
+the frame-to-frame noise that regularisation exists to control, so an
+under-regularised model scored beautifully -- its centroid sits on the dot --
+while in use it amplified landmark jitter into tens of pixels of wobble.
+Scoring frames makes the trade-off visible. Both numbers are reported: the
+per-frame error, and the settled error a steady fixation is worth.
+
+**A short median runs before the One Euro filters.** One Euro is the wrong
+tool for a single bad frame, and not by a little: it widens its cutoff in
+proportion to the signal's speed, and a one-frame spike is the fastest thing it
+ever sees, so it opens up and follows the spike and then stays open while its
+speed estimate decays. An isolated landmark failure -- a reflection off
+glasses, a frame of motion blur -- threw the estimate 256 px, three chessboard
+squares.
+
+A median absorbs a burst of `(window - 1) / 2` frames completely and then fails
+abruptly, so the window is set by how long real failures last rather than by
+taste. At 30 fps they usually last two frames, which a three-tap median only
+survives when the two happen to err in opposite directions. Five-tap costs
+33 ms of saccade latency and 1.6 px of settled error and holds the worst
+excursion to 14 px.
 
 **Both the inputs and the output are filtered.** Smoothing only the output is
 too late: the degree-2 polynomial amplifies input noise first, and amplified
-noise cannot be removed afterwards without adding visible lag. Filtering the
-iris and head features on the way in cuts peak-to-peak wobble from 98 px to
-42 px while a cross-screen saccade still settles in about 130 ms. The feature
-filters use a much larger One Euro `beta` than the output filter, because
-feature values are two orders of magnitude smaller than pixel coordinates and a
-pixel-sized `beta` would never let the filter open up during a saccade.
+noise cannot be removed afterwards without adding visible lag. Accuracy here is
+noise-limited rather than model-limited -- with perfect landmarks the same model
+reaches 20 px, against 37 px with realistic landmark jitter -- so this is where
+the remaining error lives.
+
+Both filters were swept jointly against the simulator on three competing
+measures: settled error, peak-to-peak wobble during a fixation, and how long a
+cross-screen saccade takes to land. On the medium preset that gives **5.5 px**
+settled error with **6.6 px** of wobble and a **144 ms** saccade, from 12.9 px
+and 54.5 px unfiltered.
+
+What is left is no longer noise. Of that 5.5 px, 4.8 px is systematic bias and
+only 2.5 px is frame-to-frame spread, so averaging a whole fixation perfectly
+would still leave 4.8 px -- which is why there is no fixation detector here.
+The remaining error is in the mapping, not in the smoothing.
+
+The feature filters use a One Euro `beta` three orders of magnitude larger than
+the output filter's, because feature values are two orders of magnitude smaller
+than pixel coordinates and a pixel-sized `beta` would never let the filter open
+up during a saccade. Neither `beta` may be zero: at the output filter's 0.3 Hz
+cutoff, removing the speed term takes a saccade 1355 ms to follow instead of
+133 ms, because nothing can release the filter.
 
 **Blinks hold rather than update.** MediaPipe keeps reporting iris landmarks
 while the lid is closed; they are simply wrong. Feeding them to the model throws
 the estimate and, worse, poisons the smoothing filter so the error outlives the
 blink by a second or more. During a closure, and for a short recovery window
 after it, the last good estimate is held and nothing reaches the filters.
+
+**"Closed" is learned per user, not fixed.** Openness is the lid gap over the
+eye width, and that ratio varies by more than a factor of two between people.
+A single fixed threshold either treats narrow or hooded eyes as permanently
+blinking -- no tracking at all, and calibration that rejects every frame -- or
+lets other users' blinks straight through. A high quantile of recent openness
+is the user's own baseline, and a closure is a fall to a fraction of it. The
+baseline is learned from every frame rather than from frames already judged
+open, because judging first deadlocks on exactly the users it exists for.
+
+**A gap in tracking discards the filter state.** The filters hold the last value
+they saw with no notion of how long ago that was. After the face is lost for a
+second or two -- a turn away, a hand across the face -- that value describes a
+moment that has gone, and blending it into the first frame back drags the
+estimate towards where the user *used* to be looking. Past the re-acquisition
+window the state is dropped, so tracking re-locks in one frame instead of four.
+
+**Both head-pose backends are normalised to one convention.** `solvePnP` and the
+MediaPipe Tasks transformation matrix disagreed on the sign of roll, and the
+Tasks path disagreed with its own documented convention on yaw. A calibration
+profile is numbers fitted to whatever the angles meant on the day, so an angle
+whose sign depends on the installed MediaPipe build silently invalidates saved
+profiles. Roll now comes from the eye-corner line on both paths: the corners
+are among the most stable landmarks on the face, it is one `arctan2` with
+nothing to diverge, and it is the same rotation the image-aligned iris features
+are expressed in, so the two can never disagree.
 
 **Predictions are clamped.** A polynomial extrapolates without limit, so one
 bad frame can produce a coordinate in the millions and poison the smoothing
@@ -399,12 +543,90 @@ filter for seconds. Estimates are clamped to the screen plus a margin, with an
 perfectly and generalise terribly. The model is a degree-2 polynomial ridge
 regression whose regularisation strength is chosen by leave-one-point-out CV.
 
-**Features are scale- and roll-invariant.** Every eye measurement is divided by
-that eye's own corner-to-corner width, and iris offsets are expressed in the
-eye's local frame rather than image axes. Moving closer to the camera or
-tilting your head therefore does not shift the features. Vertical offsets are
-normalised by eye *width*, not height, because eye height collapses during a
-blink.
+**Iris offsets are measured on the camera's axes, not the eye's.** Every eye
+measurement is divided by that eye's own corner-to-corner width, so moving
+closer to the camera does not shift the features. The *rotation* is the subtle
+part, and getting it wrong was this project's largest single source of error.
+
+Hold your gaze on one square and tilt your head. Where you are looking has not
+changed, and neither has the direction your eye points **in the world** -- so
+an offset resolved on the camera's axes, which do not tilt, barely moves. An
+offset resolved along the eye's own axis does move, and by about four times as
+much, because that axis has rotated underneath a direction that stayed put.
+
+Only the first of those is a function of screen position. The eye-local pair is
+where an eye is most naturally described, and for a long time it was all this
+module produced; it had discarded the head orientation that relates the eye to
+the world, and no amount of calibration recovers what was never measured. An
+eye-local model with no tilt feature costs **111 px** of error against **27 px**
+for the image-aligned one, and even handed the tilt to correct with it only
+reaches 36 px.
+
+Both frames are kept -- the eye-local pair still carries vergence and openness
+-- along with `eye_tilt`, the rotation between them, read straight off the
+eye-corner line rather than from a pose solver.
+
+Vertical offsets are normalised by eye *width*, not height, because eye height
+collapses during a blink.
+
+**The eye is measured from the eyeball's centre, not from the eye corners.**
+Every eye measurement is a displacement from some reference divided by some
+scale, and both used to come from the two corner landmarks. That was the
+accuracy ceiling of the whole tracker: the corner midpoint wobbles by 0.35 px
+between frames against the iris centre's 0.22 px, so **71% of the variance in
+the iris offset came from the reference rather than from the eye**.
+
+A scaled-orthographic camera is now fitted to a canonical head over 18 rigid
+landmarks -- one linear least-squares solve per frame, nothing to diverge and
+no previous-frame state to corrupt -- and the offset is measured from the
+projected centre of rotation of the eyeball. That point has no landmark,
+because it is inside the head, which is why it was never used; it is also the
+point the eye actually rotates about, so the measurement is the gaze direction
+rather than a proxy for it. Reference noise falls to 0.16 px and the eye-width
+estimate from 0.48 px to 0.06 px.
+
+The canonical head is an average and nobody's face is the average. The
+mismatch shows up as a bias in the fitted frame that is very nearly rigid --
+under 2 px of movement across tilts, turns and leans -- so it behaves like a
+slightly different eyeball centre, which is exactly the sort of per-user
+constant calibration absorbs.
+
+**The same fit replaces solvePnP for head pose.** Six landmarks cannot average
+anything: solvePnP's pitch wobbled by 7.5 degrees frame to frame with the head
+perfectly still, against 0.11 for the fit. Worse, six landmarks fitted to a
+canonical six leave nothing to absorb the difference between the average face
+and the person in front of the camera, so a subject 6 mm from canonical
+measured 47 px of error against the frame's 27 px.
+
+**The iris displacement is turned back into an angle before fitting.** The iris
+rides on a sphere, so its visible displacement goes as `r sin(theta)`; a screen
+is a plane, so the position looked at goes as `distance * tan(theta)`. Feeding
+the raw displacement to the model asks a polynomial to approximate
+`tan(asin(x))` on top of everything else it is fitting -- a curve that is
+nearly straight in the middle and turns sharply at the edges, which is where
+the calibration targets are sparsest. Inverting the geometry costs two square
+roots a frame and makes the feature linear in screen position to 0.2 px, worth
+a further 16%. The raw offsets are kept alongside, because the eyeball radius
+is a fixed constant and real eyes vary around it; on its own the ray degrades
+badly when that constant is too small, and with both available the fit is flat
+across the whole plausible range.
+
+**The calibration fit is robust to frames aimed somewhere else.** Least squares
+weights a sample by the square of its error, so one frame where the user
+glanced away pulls the fit further than fifty good ones hold it. The outlier
+filter catches frames that look wrong in *feature* space -- a blink, a lost
+iris -- but not the ones that look perfectly normal and are simply aimed
+elsewhere; only the fit residual reveals those. Three passes of Huber
+reweighting cost about 1% on clean data and hold the error at 22 px where plain
+least squares reaches 43 px when 8% of frames are glances.
+
+**Head position is expressed in millimetres, not pixels.** Dividing the
+apparent offset of the eyes by their apparent separation cancels the
+perspective division, giving `head_x`, `head_y` and `head_z` that are
+proportional to real displacement -- and a `head_z` proportional to distance
+rather than to its reciprocal. A degree-2 polynomial fits a straight line in
+those easily and a 1/z curve in the raw pixel values badly, which is what a
+user leaning back exposes.
 
 **One Euro filter for smoothing.** A moving average would trade jitter for lag.
 The One Euro filter filters hard when the signal is slow and relaxes as speed
@@ -484,5 +706,6 @@ research formats.
 ## Licence
 
 MIT. See `LICENSE`.
-#   C h e s s E y e T r a c k e r P r o j e c t C a p s t o n e  
+#   C h e s s E y e T r a c k e r P r o j e c t C a p s t o n e 
+ 
  

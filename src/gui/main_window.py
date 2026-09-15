@@ -446,22 +446,38 @@ class MainWindow(QMainWindow):
         fair = float(self._config.get("calibration.quality_fair_px", 0.0))
         quality = report.quality(good, fair) if report else "UNKNOWN"
 
-        message = (
-            f"Average error: {report.mean_error_px:.0f} px\n"
-            f"Median error:  {report.median_error_px:.0f} px\n"
-            f"Worst error:   {report.max_error_px:.0f} px\n"
-            f"Screen-relative: {report.mean_error_normalised * 100:.1f}% of the diagonal\n\n"
-            f"Quality: {quality}\n\n"
-            "These figures come from leave-one-point-out cross-validation, so they\n"
-            "estimate accuracy at screen positions that were not calibrated.\n"
-            "Webcam gaze tracking is an estimate, not a measurement."
-        ) if report else "Calibration finished."
+        if report:
+            message = (
+                f"Holding your gaze steady: {report.settled_error_px:.0f} px\n"
+                f"Any single frame:         {report.mean_error_px:.0f} px\n"
+                f"Worst calibration point:  {report.max_error_px:.0f} px\n\n"
+                f"Quality: {quality}\n\n"
+                "The first figure is what you will notice: it is the error once\n"
+                "smoothing has settled on a square you are looking at. The second\n"
+                "is one unsmoothed frame, which is noisier by nature.\n\n"
+                "Both come from leave-one-point-out cross-validation, so they\n"
+                "estimate accuracy at screen positions that were not calibrated.\n"
+                "Webcam gaze tracking is an estimate, not a measurement."
+            )
+            if profile.coverage_warnings:
+                message += "\n\nWhat went wrong:\n\n"
+                message += "\n\n".join(f"- {note}" for note in profile.coverage_warnings)
+        else:
+            message = "Calibration finished."
 
         if quality == "POOR":
             box = QMessageBox(self)
             box.setWindowTitle("Calibration quality is low")
-            box.setText(message + "\n\nAccuracy at this level may not resolve individual "
-                                  "squares reliably.")
+            advice = ("\n\nAccuracy at this level may not resolve individual squares "
+                      "reliably.")
+            if not profile.coverage_warnings:
+                # Nothing specific was detectable, so say what usually helps
+                # rather than leaving the user with a verdict and no next step.
+                advice += ("\n\nWhat usually helps, in order: more light on your face "
+                           "from the front; the webcam at the top centre of the screen; "
+                           "sitting 50-70 cm away; and keeping your head moving at every "
+                           "dot rather than holding still.")
+            box.setText(message + advice)
             again = box.addButton("Calibrate Again", QMessageBox.AcceptRole)
             box.addButton("Use Anyway", QMessageBox.RejectRole)
             box.exec()

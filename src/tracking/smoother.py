@@ -15,33 +15,119 @@ Reference: Casiez, Roussel & Vogel, "1 Euro Filter" (CHI 2012).
 from __future__ import annotations
 
 import math
+from collections import deque
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from statistics import median
+from typing import Deque, Dict, Optional, Tuple
 
+#: Output-filter presets, in (min_cutoff Hz, beta) pairs.
+#:
+#: Swept jointly with the feature presets below against the geometric
+#: simulator, scoring three things that trade off against each other: the error
+#: over the settled tail of a fixation, the peak-to-peak wobble during that
+#: tail, and how long a cross-screen saccade takes to land within 90 px.
+#:
+#: ``beta`` must never be zero at these cutoffs. A cutoff of 0.3 Hz with no
+#: speed term takes over a second to follow a saccade -- the filter has no
+#: mechanism to open up -- which measured as 1355 ms in the sweep against
+#: 133 ms for the value below. The low cutoff is only affordable *because*
+#: beta releases it the moment the eyes move.
 SMOOTHING_PRESETS: Dict[str, Dict[str, float]] = {
     "off": {"min_cutoff": 1000.0, "beta": 0.0},
-    "low": {"min_cutoff": 2.0, "beta": 0.02},
-    "medium": {"min_cutoff": 0.9, "beta": 0.006},
-    "high": {"min_cutoff": 0.4, "beta": 0.002},
+    "low": {"min_cutoff": 0.6, "beta": 0.015},
+    "medium": {"min_cutoff": 0.3, "beta": 0.004},
+    "high": {"min_cutoff": 0.2, "beta": 0.004},
 }
 
-#: Matching presets for the input-feature filters. These are gentler than the
-#: output presets: features are filtered before the polynomial amplifies them,
-#: so a little goes a long way, and over-filtering here would delay saccades.
-#: ``beta`` is far larger here than in the output presets, and deliberately so.
-#: One Euro relaxes its filtering in proportion to ``beta * speed``, and feature
-#: values are two orders of magnitude smaller than pixel coordinates -- an iris
-#: offset moves by ~0.1 where a gaze point moves by ~1000. A pixel-sized beta is
-#: therefore invisible against feature-sized speeds, and the filter never opens
-#: up during a saccade. Tuned against the simulator: these values cut
-#: peak-to-peak jitter from 98 px to 42 px while a cross-screen saccade still
-#: settles in ~130 ms.
+#: Matching presets for the input-feature filters.
+#:
+#: ``beta`` is three orders of magnitude larger here than in the output presets,
+#: and deliberately so. One Euro relaxes its filtering in proportion to
+#: ``beta * speed``, and feature values are two orders of magnitude smaller than
+#: pixel coordinates -- an iris offset moves by ~0.1 where a gaze point moves by
+#: ~1000. A pixel-sized beta is invisible against feature-sized speeds, and the
+#: filter would never open up during a saccade.
+#:
+#: Measured with the medium output preset: peak-to-peak wobble during a fixation
+#: falls from 58 px unfiltered to 17 px, while a cross-screen saccade still
+#: settles in about 133 ms.
 FEATURE_SMOOTHING_PRESETS: Dict[str, Dict[str, float]] = {
     "off": {"min_cutoff": 1000.0, "beta": 0.0},
     "low": {"min_cutoff": 2.0, "beta": 20.0},
-    "medium": {"min_cutoff": 1.0, "beta": 15.0},
-    "high": {"min_cutoff": 0.6, "beta": 8.0},
+    "medium": {"min_cutoff": 1.0, "beta": 10.0},
+    "high": {"min_cutoff": 0.6, "beta": 5.0},
 }
+
+#: Length of the median prefilter for each preset, in frames.
+#:
+#: A median of ``n`` absorbs a burst of up to ``(n - 1) / 2`` bad frames
+#: completely and costs roughly that many frames of latency. One frame longer
+#: than it can absorb and it fails abruptly rather than gracefully, because a
+#: median has no notion of a partly-bad sample.
+#:
+#: Worst excursion with the medium preset, over 40 runs of injected landmark
+#: spikes, as median / 90th percentile:
+#:
+#:     burst     window 1        window 3        window 5
+#:     1 frame   256 / 292 px     10 /  12 px     11 /  14 px
+#:     2 frames  359 / 456 px     99 / 348 px     11 /  14 px
+#:     3 frames  397 / 500 px    377 / 494 px     19 / 365 px
+#:
+#: A two-frame burst is the common case -- that is what a reflection off
+#: glasses or a frame of motion blur lasts at 30 fps -- and a window of 3
+#: handles it only when the two happen to err in opposite directions, which is
+#: why its median is tolerable and its 90th percentile is not.
+#:
+#: Five is therefore the default, at 33 ms of saccade latency and about 1.6 px
+#: of settled error. A 350 px excursion is four chessboard squares and lands
+#: the estimate on the wrong piece; 33 ms is one frame.
+FEATURE_MEDIAN_WINDOW: Dict[str, int] = {
+    "off": 1,
+    "low": 3,
+    "medium": 5,
+    "high": 5,
+}
+
+
+class MedianPrefilter:
+    """A short median over each channel, run before the One Euro filter.
+
+    One Euro is the wrong tool for an isolated bad frame, and not by a little:
+    it adapts its cutoff to the *speed* of the signal, so a single-frame spike
+    looks exactly like the start of a fast saccade and the filter opens up to
+    follow it. The spike passes through nearly unattenuated, and the filter
+    stays open for several frames afterwards while its speed estimate decays.
+
+    A median of the last three samples removes any spike shorter than two
+    frames outright, and costs one frame of delay on a real saccade -- which
+    the speed term then makes back. The two are complementary: the median
+    handles the outliers, One Euro handles the noise.
+    """
+
+    @classmethod
+    def from_preset(cls, preset: str) -> "MedianPrefilter":
+        return cls(FEATURE_MEDIAN_WINDOW.get(preset, FEATURE_MEDIAN_WINDOW["medium"]))
+
+    def __init__(self, window: int = 5) -> None:
+        # Even windows average the two middle samples, which lets half a spike
+        # through; odd windows pick a real sample. A window of 1 is the
+        # identity, which is how the filter is turned off.
+        self.window = max(1, int(window) | 1)
+        self._history: Dict[str, Deque[float]] = {}
+
+    def filter(self, values: Dict[str, float]) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        for name, value in values.items():
+            history = self._history.get(name)
+            if history is None:
+                history = deque(maxlen=self.window)
+                self._history[name] = history
+            history.append(float(value))
+            out[name] = float(median(history))
+        return out
+
+    def reset(self) -> None:
+        self._history.clear()
 
 
 class _LowPass:

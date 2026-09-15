@@ -45,6 +45,13 @@ EYE_LEFT_TOP2 = 158
 EYE_LEFT_BOTTOM2 = 153
 IRIS_LEFT = (468, 469, 470, 471, 472)
 
+#: The full eyelid contour, outer corner round the lower lid to the inner
+#: corner and back along the upper lid. Averaging over the ring is what makes
+#: the eye's scale and axis stable enough to normalise iris offsets against;
+#: two corner points alone are far too noisy.
+EYE_LEFT_RING = (33, 7, 163, 144, 145, 153, 154, 155, 133,
+                 173, 157, 158, 159, 160, 161, 246)
+
 # --- image-right eye --------------------------------------------------------
 EYE_RIGHT_OUTER = 263
 EYE_RIGHT_INNER = 362
@@ -53,6 +60,8 @@ EYE_RIGHT_BOTTOM = 374
 EYE_RIGHT_TOP2 = 385
 EYE_RIGHT_BOTTOM2 = 380
 IRIS_RIGHT = (473, 474, 475, 476, 477)
+EYE_RIGHT_RING = (263, 249, 390, 373, 374, 380, 381, 382, 362,
+                  398, 384, 385, 386, 387, 388, 466)
 
 # --- pose reference points --------------------------------------------------
 NOSE_TIP = 1
@@ -60,6 +69,28 @@ CHIN = 152
 MOUTH_LEFT = 61
 MOUTH_RIGHT = 291
 FOREHEAD = 10
+
+#: Landmarks that do not move with expression, used to fit the rigid face
+#: frame (see :mod:`~src.tracking.face_frame`).
+#:
+#: Membership is chosen for rigidity, not for how clearly the point shows up.
+#: Eyebrows are excluded even though they track well, because they move when
+#: someone frowns or concentrates -- which is most of a chess game. The mouth
+#: and jawline are excluded for the same reason. What is left is the bony
+#: structure: the eye corners, the bridge and sides of the nose, the temples
+#: and the upper face oval.
+RIGID_FACE_LANDMARKS = (
+    # eye corners
+    33, 133, 263, 362,
+    # nose bridge, top to tip
+    168, 6, 197, 195, 4, 1,
+    # sides of the nose
+    98, 327,
+    # temples and the upper face oval
+    127, 356, 234, 454,
+    # forehead
+    10, 151,
+)
 
 REQUIRED_LANDMARKS = 478  # 468 mesh points + 2 x 5 iris points
 

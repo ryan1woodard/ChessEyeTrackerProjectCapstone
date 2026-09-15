@@ -184,7 +184,14 @@ class TrackerWorker(QThread):
             blink_threshold=float(self._config.get("tracking.blink_ear_threshold", 0.16)),
             blink_recovery_seconds=float(
                 self._config.get("tracking.blink_recovery_ms", 120)) / 1000.0,
+            max_roll=float(self._config.get("tracking.max_head_roll_deg", 35.0)),
+            reacquire_seconds=float(
+                self._config.get("tracking.reacquire_ms", 500)) / 1000.0,
         )
+        # Opened here, inside the caller's FaceTrackerError handler, so a
+        # missing or broken MediaPipe backend is reported as the setup problem
+        # it is instead of surfacing later as "no face detected".
+        pipeline.open()
         if preset not in SMOOTHING_PRESETS:
             pipeline.smoother.set_parameters(
                 float(self._config.get("tracking.one_euro_min_cutoff", 1.0)),

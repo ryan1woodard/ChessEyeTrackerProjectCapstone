@@ -21,6 +21,13 @@ generalise terribly. Two things prevent that:
   actually cares about. Training error would look impressively small and mean
   nothing.
 
+The held-out frames are scored individually rather than averaged first. The
+average measures only the model's bias at that target and cancels the
+frame-to-frame noise regularisation exists to control, which lets an
+under-regularised model score well and then wobble badly in use. Both numbers
+are reported: ``mean_error_px`` for a single frame, ``settled_error_px`` for a
+fixation the smoothing filter has settled on.
+
 ``GazeEstimator`` is an abstract interface so the webcam estimator can later be
 swapped for a hardware eye tracker without touching the rest of the pipeline.
 """
@@ -90,17 +97,81 @@ def polynomial_expand(x: np.ndarray, degree: int) -> np.ndarray:
     return np.column_stack(columns)
 
 
-def ridge_fit(design: np.ndarray, targets: np.ndarray, alpha: float) -> np.ndarray:
-    """Solve ridge regression, leaving the bias (column 0) unpenalised."""
+def ridge_fit(design: np.ndarray, targets: np.ndarray, alpha: float,
+              weights: Optional[np.ndarray] = None) -> np.ndarray:
+    """Solve ridge regression, leaving the bias (column 0) unpenalised.
+
+    ``weights`` gives a per-sample weight; see :func:`robust_ridge_fit`.
+    """
     n_terms = design.shape[1]
     penalty = np.eye(n_terms, dtype=np.float64) * float(alpha)
     penalty[0, 0] = 0.0
-    gram = design.T @ design + penalty
-    rhs = design.T @ targets
+    if weights is None:
+        gram = design.T @ design + penalty
+        rhs = design.T @ targets
+    else:
+        weighted = design * weights[:, None]
+        gram = weighted.T @ design + penalty
+        rhs = weighted.T @ targets
     try:
         return np.linalg.solve(gram, rhs)
     except np.linalg.LinAlgError:  # pragma: no cover - singular design
         return np.linalg.lstsq(gram, rhs, rcond=None)[0]
+
+
+#: Residual, in units of the robust spread, beyond which a calibration sample
+#: stops counting in full. The classic Huber value.
+HUBER_K = 1.345
+
+#: Reweighting passes. The weights settle in two or three; more is wasted work.
+ROBUST_PASSES = 3
+
+
+def robust_ridge_fit(design: np.ndarray, targets: np.ndarray, alpha: float,
+                     passes: int = ROBUST_PASSES) -> np.ndarray:
+    """Ridge regression that a handful of bad frames cannot drag off course.
+
+    Least squares weights a sample by the square of its error, so one frame
+    where the user glanced away during collection pulls the fit further than
+    fifty good ones hold it. The outlier filter in
+    :mod:`~src.tracking.calibration` catches the frames that look wrong in
+    *feature* space -- a blink, a lost iris -- but it cannot see the ones that
+    look perfectly normal and are simply aimed somewhere else, because nothing
+    about those features is unusual. Only the fit residual reveals them.
+
+    So the fit is repeated, each pass weighting samples by how well the
+    previous one predicted them: in full inside a Huber radius of the robust
+    spread of residuals, and falling off as 1/residual beyond it. A glance away
+    ends up contributing a fraction of a sample instead of dominating its
+    target.
+    """
+    weights = None
+    coefficients = ridge_fit(design, targets, alpha)
+    for _ in range(max(passes, 1)):
+        residuals = np.hypot(*(design @ coefficients - targets).T)
+        # Median absolute deviation, scaled to a standard deviation for normal
+        # data. Using the plain standard deviation here would be self-defeating:
+        # the outliers this exists to find would inflate it and then look normal.
+        median = float(np.median(residuals))
+        spread = float(np.median(np.abs(residuals - median))) / 0.6745
+        if spread < 1e-9:
+            break
+        scaled = residuals / (HUBER_K * spread)
+        weights = np.where(scaled <= 1.0, 1.0, 1.0 / np.maximum(scaled, 1e-9))
+        coefficients = ridge_fit(design, targets, alpha, weights)
+    return coefficients
+
+
+@dataclass(frozen=True)
+class _AlphaScore:
+    """One regularisation strength and how it scored in cross-validation."""
+
+    alpha: float
+    #: Mean error over individual held-out frames; what ``alpha`` is chosen on.
+    frame_error: float
+    standard_error: float
+    #: Per-target centroid errors; what a settled fixation is worth.
+    point_errors: List[float] = field(default_factory=list)
 
 
 @dataclass
@@ -112,6 +183,10 @@ class FitReport:
     max_error_px: float
     mean_error_normalised: float
     per_point_error_px: List[float] = field(default_factory=list)
+    #: Cross-validated error of the *average* of the held-out frames at each
+    #: target: the accuracy of a steady fixation once smoothing has settled.
+    #: ``mean_error_px`` is the harsher single-frame figure.
+    settled_error_px: float = 0.0
     train_mean_error_px: float = 0.0
     alpha: float = 0.0
     n_samples: int = 0
@@ -129,9 +204,14 @@ class FitReport:
         """
         good = good_px if good_px > 0 else self.diagonal_px * 0.055
         fair = fair_px if fair_px > 0 else self.diagonal_px * 0.095
-        if self.mean_error_px <= good:
+        # Rated on the settled error, because that is what someone holding
+        # their gaze on a square experiences; the single-frame figure is
+        # reported alongside it but is dominated by landmark noise the
+        # smoothing filter removes.
+        score = self.settled_error_px or self.mean_error_px
+        if score <= good:
             return "GOOD"
-        if self.mean_error_px <= fair:
+        if score <= fair:
             return "FAIR"
         return "POOR"
 
@@ -149,6 +229,7 @@ class FitReport:
             "max_error_px": self.max_error_px,
             "mean_error_normalised": self.mean_error_normalised,
             "per_point_error_px": list(self.per_point_error_px),
+            "settled_error_px": self.settled_error_px,
             "train_mean_error_px": self.train_mean_error_px,
             "alpha": self.alpha,
             "n_samples": self.n_samples,
@@ -163,6 +244,7 @@ class FitReport:
             max_error_px=float(data.get("max_error_px", 0.0)),
             mean_error_normalised=float(data.get("mean_error_normalised", 0.0)),
             per_point_error_px=list(data.get("per_point_error_px", [])),
+            settled_error_px=float(data.get("settled_error_px", 0.0)),
             train_mean_error_px=float(data.get("train_mean_error_px", 0.0)),
             alpha=float(data.get("alpha", 0.0)),
             n_samples=int(data.get("n_samples", 0)),
@@ -270,6 +352,39 @@ class RidgeGazeEstimator(GazeEstimator):
                (oy - margin) <= y <= (oy + height + margin)
 
     # ------------------------------------------------------------------- fit
+    @staticmethod
+    def input_range(raw_features: np.ndarray,
+                    feature_names: Sequence[str],
+                    widen: float = 0.25,
+                    floor_fraction: float = 0.25) -> Tuple[np.ndarray, np.ndarray]:
+        """The feature box :meth:`clamp_inputs` saturates against.
+
+        Derived from the calibration data, then widened, then **floored at a
+        fraction of each feature's nominal range**. The floor is what makes
+        this safe: a user who never tilted their head during calibration
+        produces an ``eye_tilt`` span of almost nothing, and a box drawn from
+        that span alone can collapse to a point, pinning the feature and
+        throwing away whatever compensation it was there to provide.
+
+        Both constants are small on purpose. Sweeping them in the simulator,
+        every value of ``widen`` above 0.25 made a calibration that never
+        covered tilt *worse* -- letting the polynomial extrapolate turns a
+        bounded bias into a runaway -- and every value of ``floor_fraction``
+        above 0.25 did the same. Neither constant changes the result at all
+        once calibration actually covers the range, which is what the posture
+        prompts exist to bring about. Generous extrapolation is not a
+        substitute for data.
+        """
+        low = raw_features.min(axis=0)
+        high = raw_features.max(axis=0)
+        span = np.maximum(high - low, 1e-6)
+        low, high = low - span * widen, high + span * widen
+
+        floor = nominal_scales(feature_names) * floor_fraction
+        centre = 0.5 * (low + high)
+        half = np.maximum(0.5 * (high - low), floor)
+        return centre - half, centre + half
+
     @classmethod
     def fit(
         cls,
@@ -281,6 +396,7 @@ class RidgeGazeEstimator(GazeEstimator):
         screen_origin: Tuple[int, int] = (0, 0),
         degree: int = 2,
         alphas: Sequence[float] = (0.01, 0.1, 1.0, 10.0, 100.0),
+        margin_fraction: float = 0.15,
     ) -> "RidgeGazeEstimator":
         """Fit the mapping and cross-validate the regularisation strength.
 
@@ -320,24 +436,42 @@ class RidgeGazeEstimator(GazeEstimator):
         # Leave-one-point-out: every sample from a target is held out together,
         # so the error estimates accuracy at screen positions the model has
         # never seen.
-        per_alpha: List[tuple[float, float, float, List[float]]] = []
+        per_alpha: List[_AlphaScore] = []
         for alpha in alphas:
-            errors: List[float] = []
+            frame_errors: List[float] = []
+            point_errors: List[float] = []
             for group in unique_groups:
                 held_out = groups == group
                 if held_out.all():
                     continue
-                weights = ridge_fit(design[~held_out], targets[~held_out], alpha)
-                predicted = (design[held_out] @ weights).mean(axis=0)
-                actual = targets[held_out].mean(axis=0)
-                errors.append(float(np.hypot(*(predicted - actual))))
-            if not errors:
+                weights = robust_ridge_fit(design[~held_out], targets[~held_out], alpha)
+                predicted = design[held_out] @ weights
+                actual = targets[held_out]
+                # Two different questions, both worth answering.
+                #
+                # The per-FRAME error is what a single webcam frame is worth,
+                # and it is the one ``alpha`` is chosen against. Scoring the
+                # average of the held-out frames instead -- as this did
+                # originally -- measures only the model's bias at that target
+                # and cancels exactly the frame-to-frame noise that
+                # regularisation exists to control. Judged that way an
+                # under-regularised model looks excellent, because its centroid
+                # sits on the dot, while in use it amplifies landmark jitter
+                # into tens of pixels of wobble.
+                frame_errors.extend(np.hypot(*(predicted - actual).T).tolist())
+                # The per-POINT error is the centroid error once the smoothing
+                # filter has settled, i.e. what a steady fixation is worth. It
+                # is reported, not optimised.
+                point_errors.append(float(np.hypot(
+                    *(predicted.mean(axis=0) - actual.mean(axis=0)))))
+            if not frame_errors:
                 continue
-            mean_error = float(np.mean(errors))
-            standard_error = float(np.std(errors) / np.sqrt(len(errors)))
-            per_alpha.append((alpha, mean_error, standard_error, errors))
-            logger.debug("alpha=%.4g  LOPO mean error=%.1f px (+/- %.1f)",
-                         alpha, mean_error, standard_error)
+            mean_error = float(np.mean(frame_errors))
+            standard_error = float(np.std(frame_errors) / np.sqrt(len(frame_errors)))
+            per_alpha.append(_AlphaScore(alpha, mean_error, standard_error, point_errors))
+            logger.debug("alpha=%.4g  LOPO frame error=%.1f px (+/- %.1f), "
+                         "settled error=%.1f px",
+                         alpha, mean_error, standard_error, float(np.mean(point_errors)))
 
         if not per_alpha:  # pragma: no cover - defensive
             raise ValueError("Cross-validation produced no usable folds")
@@ -348,45 +482,42 @@ class RidgeGazeEstimator(GazeEstimator):
         # minimum is noisy, and the simpler model extrapolates far better
         # outside the calibrated region -- which is where a gaze tracker spends
         # most of its time.
-        best_alpha, best_error, best_se, best_per_point = min(per_alpha, key=lambda r: r[1])
-        threshold = best_error + best_se
-        for alpha, mean_error, _se, errors in sorted(per_alpha, key=lambda r: -r[0]):
-            if mean_error <= threshold:
-                best_alpha, best_error, best_per_point = alpha, mean_error, errors
+        best = min(per_alpha, key=lambda score: score.frame_error)
+        threshold = best.frame_error + best.standard_error
+        for score in sorted(per_alpha, key=lambda s: -s.alpha):
+            if score.frame_error <= threshold:
+                best = score
                 break
 
-        # Widen the observed range a little: the user will not reproduce their
-        # calibration posture exactly, and mild extrapolation is well behaved.
-        observed_low = raw_features.min(axis=0)
-        observed_high = raw_features.max(axis=0)
-        span = np.maximum(observed_high - observed_low, 1e-6)
-        input_low = observed_low - span * 0.5
-        input_high = observed_high + span * 0.5
+        input_low, input_high = cls.input_range(raw_features, feature_names)
 
-        weights = ridge_fit(design, targets, best_alpha)
+        weights = robust_ridge_fit(design, targets, best.alpha)
         train_predictions = design @ weights
         train_error = float(np.mean(np.hypot(*(train_predictions - targets).T)))
 
         diagonal = float(np.hypot(*screen_size))
+        point_errors = best.point_errors
         report = FitReport(
-            mean_error_px=best_error,
-            median_error_px=float(np.median(best_per_point)) if best_per_point else 0.0,
-            max_error_px=float(np.max(best_per_point)) if best_per_point else 0.0,
-            mean_error_normalised=best_error / diagonal if diagonal else 0.0,
-            per_point_error_px=[float(e) for e in best_per_point],
+            mean_error_px=best.frame_error,
+            median_error_px=float(np.median(point_errors)) if point_errors else 0.0,
+            max_error_px=float(np.max(point_errors)) if point_errors else 0.0,
+            mean_error_normalised=best.frame_error / diagonal if diagonal else 0.0,
+            per_point_error_px=[float(e) for e in point_errors],
+            settled_error_px=float(np.mean(point_errors)) if point_errors else 0.0,
             train_mean_error_px=train_error,
-            alpha=float(best_alpha),
+            alpha=float(best.alpha),
             n_samples=int(raw_features.shape[0]),
             n_points=int(len(unique_groups)),
         )
         logger.info(
             "Calibration fitted: %d points / %d samples, alpha=%.4g, "
-            "LOPO mean error=%.1f px (train %.1f px)",
+            "LOPO frame error=%.1f px, settled %.1f px (train %.1f px)",
             report.n_points, report.n_samples, report.alpha,
-            report.mean_error_px, report.train_mean_error_px,
+            report.mean_error_px, report.settled_error_px, report.train_mean_error_px,
         )
         return cls(feature_names, degree, mean, scale, weights,
                    screen_size, screen_origin, report,
+                   margin_fraction=margin_fraction,
                    input_low=input_low, input_high=input_high)
 
     # --------------------------------------------------------- serialisation
@@ -402,6 +533,7 @@ class RidgeGazeEstimator(GazeEstimator):
             "weights": self.weights.tolist(),
             "screen_size": list(self.screen_size),
             "screen_origin": list(self.screen_origin),
+            "margin_fraction": self.margin_fraction,
             "report": self.report.to_dict() if self.report else None,
             "input_low": self.input_low.tolist() if self.input_low is not None else None,
             "input_high": self.input_high.tolist() if self.input_high is not None else None,
@@ -418,6 +550,7 @@ class RidgeGazeEstimator(GazeEstimator):
             weights=np.array(data["weights"], dtype=np.float64),
             screen_size=tuple(data.get("screen_size", (1920, 1080))),
             screen_origin=tuple(data.get("screen_origin", (0, 0))),
+            margin_fraction=float(data.get("margin_fraction", 0.15)),
             report=report,
             input_low=np.array(data["input_low"], dtype=np.float64)
             if data.get("input_low") is not None else None,
